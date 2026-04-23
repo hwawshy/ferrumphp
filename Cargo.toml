@@ -1,0 +1,13 @@
+[package]
+name = "ferrumphp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ext-php-rs = { version = "*", features = ["embed"] }
+crossbeam-channel = "0.5.15"
+hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+tower = "0.5.3"
+tokio-util = "0.7.18"

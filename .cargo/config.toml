@@ -1,0 +1,3 @@
+[env]
+PHP = "/opt/php-8.5-embed-zts-debug/bin/php"
+PHP_CONFIG = "/opt/php-8.5-embed-zts-debug/bin/php-config"
