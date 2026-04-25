@@ -36,11 +36,22 @@ impl WorkerPool {
                 }
             }
 
+            println!("Receiver closed, shutting down workers...");
+
+            // signal workers to shut down
+            drop(tx_req);
+
             for w in workers {
                 w.join().unwrap()
             }
+
+            println!("Workers shutdown complete");
         });
 
         Self { handle }
+    }
+
+    pub fn join(self) -> std::thread::Result<()> {
+        self.handle.join()
     }
 }

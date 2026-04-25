@@ -68,9 +68,7 @@ impl Future for PhpFuture {
     type Output = Result<Response<String>, PhpError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        match this {
+        match self.get_mut() {
             PhpFuture::Err(e) => Poll::Ready(Err(*e)),
             PhpFuture::Ok(receiver) => match receiver.poll_recv(cx) {
                 Poll::Pending => Poll::Pending,

@@ -25,29 +25,28 @@ impl WorkerGuard {
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
         unsafe {
-            ext_php_rs_sapi_per_thread_shutdown();
-
             let server_context = SapiGlobals::get_mut().server_context;
             if !server_context.is_null() {
                 let _ = Box::from_raw(server_context);
             }
+
+            ext_php_rs_sapi_per_thread_shutdown();
         }
     }
 }
 
 pub struct Worker {
     handle: JoinHandle<()>,
-    receiver: Receiver<Job>,
 }
 
 impl Worker {
-    pub fn new(id: u32, receiver: Receiver<Job>) -> Self {
-        let rx = receiver.clone();
+    pub fn new(id: u32, rx: Receiver<Job>) -> Self {
         let handle = std::thread::spawn(move || {
             let _guard = WorkerGuard::new();
 
             loop {
                 let Ok(job) = rx.recv() else {
+                    println!("Worker {} shutting down", id);
                     break;
                 };
 
@@ -100,7 +99,7 @@ impl Worker {
             }
         });
 
-        Self { handle, receiver }
+        Self { handle }
     }
 
     pub fn join(self) -> std::thread::Result<()> {
