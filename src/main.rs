@@ -39,23 +39,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             },
             _ = tokio::signal::ctrl_c() => {
                 println!("Starting graceful shutdown");
-                // signal worker pool to shut down
-                drop((async_request_sender));
                 break;
             }
         }
     }
 
-    match timeout(Duration::from_secs(10), async {
-        graceful.shutdown().await;
+    tokio::select! {
+        result = async {
+            graceful.shutdown().await;
 
-        tokio::task::spawn_blocking(|| pool.join().unwrap()).await
-    })
-    .await
-    {
-        Err(_) => println!("Time out while waiting for graceful shutdown, aborting..."),
-        Ok(Err(e)) => println!("Error while shutting down: {}", e),
-        Ok(Ok(())) => println!("Graceful shutdown complete"),
+            // signal worker pool to shut down
+            drop(async_request_sender);
+
+            tokio::task::spawn_blocking(|| pool.join().unwrap()).await
+        } => {
+            if let Err(e) = result {
+                println!("Error while shutting down: {}", e)
+            } else {
+                println!("Graceful shutdown complete")
+            }
+        },
+        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+            println!("Time out while waiting for graceful shutdown, aborting...")
+        }
     }
 
     Ok(())
