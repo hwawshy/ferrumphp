@@ -6,7 +6,6 @@ use ext_php_rs::ffi::{
     ZEND_RESULT_CODE_SUCCESS, php_execute_script, php_request_shutdown, php_request_startup,
     zend_destroy_file_handle, zend_file_handle, zend_stream_init_filename,
 };
-use ext_php_rs::zend::SapiGlobals;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
@@ -15,8 +14,10 @@ use std::thread::JoinHandle;
 struct WorkerGuard;
 
 impl WorkerGuard {
-    pub fn new() -> Self {
+    pub fn new(worker_id: u32) -> Self {
         unsafe { ext_php_rs_sapi_per_thread_init() }
+
+        ServerContext::init(worker_id);
 
         Self
     }
@@ -24,12 +25,9 @@ impl WorkerGuard {
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        unsafe {
-            let server_context = SapiGlobals::get_mut().server_context;
-            if !server_context.is_null() {
-                let _ = Box::from_raw(server_context);
-            }
+        ServerContext::destroy();
 
+        unsafe {
             ext_php_rs_sapi_per_thread_shutdown();
         }
     }
@@ -42,7 +40,7 @@ pub struct Worker {
 impl Worker {
     pub fn new(id: u32, rx: Receiver<Job>) -> Self {
         let handle = std::thread::spawn(move || {
-            let _guard = WorkerGuard::new();
+            let _guard = WorkerGuard::new(id);
 
             loop {
                 let Ok(job) = rx.recv() else {
@@ -50,16 +48,7 @@ impl Worker {
                     break;
                 };
 
-                {
-                    let mut sg = SapiGlobals::get_mut();
-                    if sg.server_context.is_null() {
-                        sg.server_context =
-                            Box::into_raw(Box::new(ServerContext::new(job.respond_to, id))).cast();
-                    } else {
-                        let sc = unsafe { &mut *(sg.server_context as *mut ServerContext) };
-                        sc.sender = Some(job.respond_to);
-                    }
-                }
+                ServerContext::start_request(job.respond_to);
 
                 unsafe {
                     if php_request_startup() != ZEND_RESULT_CODE_SUCCESS {
@@ -92,13 +81,7 @@ impl Worker {
 
                     php_request_shutdown(std::ptr::null_mut());
 
-                    {
-                        let sg = SapiGlobals::get_mut();
-                        let sc = &mut *(sg.server_context as *mut ServerContext);
-                        
-                        // drop sender to signal end of request
-                        sc.sender = None;
-                    }
+                    ServerContext::finish();
 
                     let _ = CString::from_raw(filename_ptr);
                 }

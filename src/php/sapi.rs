@@ -1,12 +1,14 @@
 use bytes::Bytes;
 use ext_php_rs::embed::{Sapi as SapiTrait, ServerContext as ServerContextTrait, *};
-use ext_php_rs::ffi::{php_module_shutdown, php_module_startup, sapi_shutdown, sapi_startup};
+use ext_php_rs::ffi::{
+    ext_php_rs_sapi_globals, php_module_shutdown, php_module_startup, sapi_shutdown, sapi_startup,
+};
 use std::ffi::CString;
 use tokio::sync::mpsc::Sender;
 
 pub struct ServerContext {
-    pub(super) sender: Option<Sender<Bytes>>,
-    pub(super) worker_id: u32,
+    sender: Option<Sender<Bytes>>,
+    worker_id: u32,
 }
 
 impl ServerContextTrait for ServerContext {
@@ -26,11 +28,48 @@ impl ServerContextTrait for ServerContext {
 }
 
 impl ServerContext {
-    pub fn new(sender: Sender<Bytes>, worker_id: u32) -> Self {
-        Self {
-            sender: Some(sender),
-            worker_id,
+    pub fn init(worker_id: u32) {
+        let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
+        if !sg.server_context.is_null() {
+            panic!("server context already set");
         }
+
+        sg.server_context = Box::into_raw(Box::new(Self {
+            sender: None,
+            worker_id,
+        }))
+        .cast();
+    }
+
+    pub fn start_request(sender: Sender<Bytes>) {
+        let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
+
+        if sg.server_context.is_null() {
+            panic!("server context not set");
+        }
+
+        let sc = unsafe { &mut *(sg.server_context as *mut Self) };
+        sc.sender = Some(sender);
+    }
+
+    pub fn finish() {
+        let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
+        if sg.server_context.is_null() {
+            return;
+        }
+
+        let sc = unsafe { &mut *(sg.server_context as *mut Self) };
+        // drop sender to signal end of request
+        sc.sender = None;
+    }
+
+    pub fn destroy() {
+        let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
+        if sg.server_context.is_null() {
+            panic!("server context not set");
+        }
+
+        let _ = unsafe { Box::from_raw(sg.server_context as *mut Self) };
     }
 }
 
