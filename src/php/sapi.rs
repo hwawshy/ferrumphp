@@ -42,34 +42,32 @@ impl ServerContext {
     }
 
     pub fn start_request(sender: Sender<Bytes>) {
-        let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
+        let ctx = Self::get_mut().expect("server context not set");
 
-        if sg.server_context.is_null() {
-            panic!("server context not set");
-        }
-
-        let sc = unsafe { &mut *(sg.server_context as *mut Self) };
-        sc.sender = Some(sender);
+        ctx.sender = Some(sender);
     }
 
     pub fn finish() {
-        let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
-        if sg.server_context.is_null() {
-            return;
-        }
+        let ctx = Self::get_mut().expect("server context not set");
 
-        let sc = unsafe { &mut *(sg.server_context as *mut Self) };
         // drop sender to signal end of request
-        sc.sender = None;
+        ctx.sender = None;
     }
 
     pub fn destroy() {
+        let ctx = Self::get_mut().expect("server context not set");
+
+        let _ = unsafe { Box::from_raw(ctx as *mut Self) };
+    }
+
+    fn get_mut() -> Option<&'static mut Self> {
         let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
+
         if sg.server_context.is_null() {
-            panic!("server context not set");
+            return None;
         }
 
-        let _ = unsafe { Box::from_raw(sg.server_context as *mut Self) };
+        Some(unsafe { &mut *(sg.server_context as *mut Self) })
     }
 }
 
