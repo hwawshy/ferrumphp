@@ -7,7 +7,6 @@ use hyper_util::service::TowerToHyperService;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::time::timeout;
 
 mod php;
 

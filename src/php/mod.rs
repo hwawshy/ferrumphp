@@ -1,5 +1,6 @@
 use crate::php::sapi::Sapi;
 use crate::php::worker::Worker;
+use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use std::thread::JoinHandle;
@@ -12,7 +13,7 @@ mod worker;
 
 pub struct Job {
     pub request: Request<Incoming>,
-    pub respond_to: Sender<Response<String>>,
+    pub respond_to: Sender<Bytes>,
 }
 
 pub struct WorkerPool {

@@ -1,11 +1,11 @@
+use bytes::Bytes;
 use ext_php_rs::embed::{Sapi as SapiTrait, ServerContext as ServerContextTrait, *};
 use ext_php_rs::ffi::{php_module_shutdown, php_module_startup, sapi_shutdown, sapi_startup};
-use hyper::Response;
 use std::ffi::CString;
 use tokio::sync::mpsc::Sender;
 
 pub struct ServerContext {
-    pub(super) sender: Sender<Response<String>>,
+    pub(super) sender: Option<Sender<Bytes>>,
     pub(super) worker_id: u32,
 }
 
@@ -26,8 +26,11 @@ impl ServerContextTrait for ServerContext {
 }
 
 impl ServerContext {
-    pub fn new(sender: Sender<Response<String>>, worker_id: u32) -> Self {
-        Self { sender, worker_id }
+    pub fn new(sender: Sender<Bytes>, worker_id: u32) -> Self {
+        Self {
+            sender: Some(sender),
+            worker_id,
+        }
     }
 }
 
@@ -51,7 +54,11 @@ impl SapiTrait for Sapi {
             _ctx.worker_id
         );
 
-        _ctx.sender.blocking_send(Response::new(body)).unwrap();
+        _ctx.sender
+            .as_ref()
+            .expect("ub_write found no sender")
+            .blocking_send(Bytes::from(body))
+            .unwrap();
         buf.len()
     }
     fn log_message(msg: &str, _: i32) {
@@ -61,9 +68,8 @@ impl SapiTrait for Sapi {
 
 impl Sapi {
     pub fn new() -> Self {
-        let sapi_ptr = Self::build_module()
-            .expect("Failed to create SAPI")
-            .into_raw();
+        let module = Self::build_module().expect("Failed to build SAPI");
+        let sapi_ptr = module.into_raw();
 
         unsafe {
             ext_php_rs_sapi_startup();

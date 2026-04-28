@@ -56,10 +56,8 @@ impl Worker {
                         sg.server_context =
                             Box::into_raw(Box::new(ServerContext::new(job.respond_to, id))).cast();
                     } else {
-                        let sc_cast = sg.server_context as *mut ServerContext;
-                        unsafe {
-                            (*sc_cast).sender = job.respond_to;
-                        }
+                        let sc = unsafe { &mut *(sg.server_context as *mut ServerContext) };
+                        sc.sender = Some(job.respond_to);
                     }
                 }
 
@@ -93,6 +91,14 @@ impl Worker {
                     zend_destroy_file_handle(&mut file_handle);
 
                     php_request_shutdown(std::ptr::null_mut());
+
+                    {
+                        let sg = SapiGlobals::get_mut();
+                        let sc = &mut *(sg.server_context as *mut ServerContext);
+                        
+                        // drop sender to signal end of request
+                        sc.sender = None;
+                    }
 
                     let _ = CString::from_raw(filename_ptr);
                 }
