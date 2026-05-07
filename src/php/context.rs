@@ -5,32 +5,31 @@ use ext_php_rs::ffi::{
     php_request_startup, zend_destroy_file_handle, zend_file_handle, zend_stream_init_filename,
 };
 use ext_php_rs::zend::SapiGlobals;
-use hyper::body::Incoming;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use hyper::http::request::Parts;
 use hyper::{HeaderMap, Request, StatusCode, Version};
 use std::ffi::{CString, NulError, c_int};
 use std::mem::MaybeUninit;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Sender as OneshotSender;
 
 pub struct ServerContext {
     pub worker_id: u32,
-    local_addr: Option<SocketAddr>,
-    peer_addr: Option<SocketAddr>,
     pub response_tx: Option<Sender<Bytes>>,
     pub headers_tx: Option<OneshotSender<HeaderMap>>,
+    pub request_body: Option<Bytes>,
+    _private: (),
 }
 
 impl ServerContext {
     fn new(worker_id: u32) -> Self {
         Self {
             worker_id,
-            local_addr: None,
-            peer_addr: None,
             response_tx: None,
             headers_tx: None,
+            request_body: None,
+            _private: (),
         }
     }
 
@@ -64,19 +63,23 @@ impl WorkerContext {
 
     pub fn handle_request(
         &mut self,
-        request: Request<Incoming>,
+        request: Request<Bytes>,
         response_tx: Sender<Bytes>,
         header_tx: OneshotSender<HeaderMap>,
     ) {
         self.server_ctx.response_tx = Some(response_tx);
         self.server_ctx.headers_tx = Some(header_tx);
 
+        let (head, body) = request.into_parts();
+
+        self.server_ctx.request_body = Some(body);
+
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("src/php/test.php");
 
         let filename = path.to_str().unwrap();
 
-        let request_context = PhpRequestContext::new(request, filename).unwrap();
+        let request_context = PhpRequestContext::new(head, filename).unwrap();
 
         request_context.execute();
     }
@@ -104,18 +107,18 @@ struct PhpRequestContext {
 
 impl PhpRequestContext {
     // @TODO validation and suitable error type
-    pub fn new(request: Request<Incoming>, filename: &str) -> Result<Self, NulError> {
+    pub fn new(head: Parts, filename: &str) -> Result<Self, NulError> {
         let filename = CString::new(filename)?;
 
-        let method = CString::new(request.method().as_str())?;
+        let method = CString::new(head.method.as_str())?;
 
-        let uri = request.uri();
+        let uri = head.uri;
 
         let query = uri.query().and_then(|query| CString::new(query).ok());
 
         let uri = CString::new(uri.to_string())?;
 
-        let headers = request.headers();
+        let headers = head.headers;
 
         let content_length = headers
             .get(CONTENT_LENGTH)
@@ -127,7 +130,7 @@ impl PhpRequestContext {
             .and_then(|c| c.to_str().ok())
             .and_then(|c| CString::new(c).ok());
 
-        let proto_num = match request.version() {
+        let proto_num = match head.version {
             Version::HTTP_09 => 900,
             Version::HTTP_10 => 1000,
             Version::HTTP_11 => 1100,

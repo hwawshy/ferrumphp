@@ -1,5 +1,5 @@
 use crate::php::context::ServerContext;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use ext_php_rs::builders::SapiBuilder;
 use ext_php_rs::embed::{
     SapiModule, ServerVarRegistrar, ext_php_rs_sapi_shutdown, ext_php_rs_sapi_startup,
@@ -9,10 +9,11 @@ use ext_php_rs::ffi::{
     sapi_headers_struct, sapi_shutdown, sapi_startup,
 };
 use ext_php_rs::types::Zval;
-use ext_php_rs::zend::{SapiGlobals, SapiHeaders};
+use ext_php_rs::zend::SapiGlobals;
 use hyper::HeaderMap;
 use hyper::header::{HeaderName, HeaderValue};
-use std::ffi::{CStr, CString, NulError, c_char, c_int, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
+use std::io::Read;
 use std::str::FromStr;
 
 pub struct Sapi(*mut SapiModule);
@@ -29,7 +30,7 @@ impl Sapi {
             //.activate_function(Self::activate)
             // .log_message_function(Self::log_message)
             .send_headers_function(send_headers)
-            // .read_post_function(Self::read_post)
+            .read_post_function(read_post)
             .read_cookies_function(read_cookies)
             .register_server_variables_function(register_server_variables)
             .build()
@@ -148,16 +149,23 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
     1 // Sent successfully
 }
 
-// extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
-//     if buffer.is_null() || length == 0 {
-//         return 0;
-//     }
-//     let Some(ctx) = ServerContext::get_mut() else {
-//         return 0;
-//     };
-//     let buf = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
-//     0
-// }
+extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
+    if buffer.is_null() || length == 0 {
+        return 0;
+    }
+
+    let Some(ctx) = ServerContext::get_mut() else {
+        return 0;
+    };
+
+    let Some(ref mut body) = ctx.request_body else {
+        return 0;
+    };
+
+    let buf = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
+
+    body.reader().read(buf).unwrap_or_else(|_| 0)
+}
 
 extern "C" fn read_cookies() -> *mut c_char {
     std::ptr::null_mut()
