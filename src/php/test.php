@@ -1,8 +1,13 @@
 <?php
     ob_start();
+
     echo "Hi from PHP!";
 
-    //flush();
+    setcookie("langcookie", "cookiedata");
+
+    flush();
     ob_flush();
 
-    echo " Hi again!";
+    header("Example-Test: foo");
+
+    print_r($_SERVER);

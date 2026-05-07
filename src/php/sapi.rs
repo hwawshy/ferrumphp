@@ -1,112 +1,40 @@
+use crate::php::context::ServerContext;
 use bytes::Bytes;
-use ext_php_rs::embed::{Sapi as SapiTrait, ServerContext as ServerContextTrait, *};
-use ext_php_rs::ffi::{
-    ext_php_rs_sapi_globals, php_module_shutdown, php_module_startup, sapi_shutdown, sapi_startup,
+use ext_php_rs::builders::SapiBuilder;
+use ext_php_rs::embed::{
+    SapiModule, ServerVarRegistrar, ext_php_rs_sapi_shutdown, ext_php_rs_sapi_startup,
 };
-use std::ffi::CString;
-use tokio::sync::mpsc::Sender;
-
-pub struct ServerContext {
-    sender: Option<Sender<Bytes>>,
-    worker_id: u32,
-}
-
-impl ServerContextTrait for ServerContext {
-    fn init_request_info(&self, _info: &mut RequestInfo) {}
-    fn read_post(&mut self, _buf: &mut [u8]) -> usize {
-        0
-    }
-    fn read_cookies(&self) -> Option<&str> {
-        None
-    }
-    fn finish_request(&mut self) -> bool {
-        true
-    }
-    fn is_request_finished(&self) -> bool {
-        true
-    }
-}
-
-impl ServerContext {
-    pub fn init(worker_id: u32) {
-        let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
-        if !sg.server_context.is_null() {
-            panic!("server context already set");
-        }
-
-        sg.server_context = Box::into_raw(Box::new(Self {
-            sender: None,
-            worker_id,
-        }))
-        .cast();
-    }
-
-    pub fn start_request(sender: Sender<Bytes>) {
-        let ctx = Self::get_mut().expect("server context not set");
-
-        ctx.sender = Some(sender);
-    }
-
-    pub fn finish() {
-        let ctx = Self::get_mut().expect("server context not set");
-
-        // drop sender to signal end of request
-        ctx.sender = None;
-    }
-
-    pub fn destroy() {
-        let ctx = Self::get_mut().expect("server context not set");
-
-        let _ = unsafe { Box::from_raw(ctx as *mut Self) };
-    }
-
-    fn get_mut() -> Option<&'static mut Self> {
-        let sg = unsafe { &mut *ext_php_rs_sapi_globals() };
-
-        if sg.server_context.is_null() {
-            return None;
-        }
-
-        Some(unsafe { &mut *(sg.server_context as *mut Self) })
-    }
-}
+use ext_php_rs::ffi::{
+    ZEND_RESULT_CODE_SUCCESS, php_module_shutdown, php_module_startup, sapi_header_struct,
+    sapi_headers_struct, sapi_shutdown, sapi_startup,
+};
+use ext_php_rs::types::Zval;
+use ext_php_rs::zend::{SapiGlobals, SapiHeaders};
+use hyper::HeaderMap;
+use hyper::header::{HeaderName, HeaderValue};
+use std::ffi::{CStr, CString, NulError, c_char, c_int, c_void};
+use std::str::FromStr;
 
 pub struct Sapi(*mut SapiModule);
 
 unsafe impl Send for Sapi {}
 unsafe impl Sync for Sapi {}
 
-impl SapiTrait for Sapi {
-    type Context = ServerContext;
-    fn name() -> &'static str {
-        "ferrumphp"
-    }
-    fn pretty_name() -> &'static str {
-        "FerrumPHP"
-    }
-    fn ub_write(_ctx: &mut ServerContext, buf: &[u8]) -> usize {
-        let body = format!(
-            "{} from Worker #{}",
-            String::from_utf8_lossy(buf).to_string(),
-            _ctx.worker_id
-        );
-
-        _ctx.sender
-            .as_ref()
-            .expect("ub_write found no sender")
-            .blocking_send(Bytes::from(body))
-            .unwrap();
-        buf.len()
-    }
-    fn log_message(msg: &str, _: i32) {
-        eprintln!("{msg}");
-    }
-}
-
 impl Sapi {
     pub fn new() -> Self {
-        let module = Self::build_module().expect("Failed to build SAPI");
-        let sapi_ptr = module.into_raw();
+        let sapi_ptr = SapiBuilder::new("ferrumphp", "FerrumPHP")
+            .ub_write_function(ub_write)
+            .flush_function(flush)
+            .deactivate_function(deactivate)
+            //.activate_function(Self::activate)
+            // .log_message_function(Self::log_message)
+            .send_headers_function(send_headers)
+            // .read_post_function(Self::read_post)
+            .read_cookies_function(read_cookies)
+            .register_server_variables_function(register_server_variables)
+            .build()
+            .expect("Failed to build SAPI")
+            .into_raw();
 
         unsafe {
             ext_php_rs_sapi_startup();
@@ -146,4 +74,125 @@ impl Drop for Sapi {
             }
         }
     }
+}
+
+// extern "C" fn activate() -> c_int {
+//     0
+// }
+
+extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
+    println!("ub_write");
+
+    if str.is_null() || str_length == 0 {
+        return 0;
+    }
+    let Some(ctx) = ServerContext::get_mut() else {
+        return 0;
+    };
+
+    let buf = unsafe { std::slice::from_raw_parts(str.cast::<u8>(), str_length) };
+
+    let body = format!(
+        "{} from Worker #{}",
+        String::from_utf8_lossy(buf).to_string(),
+        ctx.worker_id
+    );
+
+    // This will buffer if headers are not sent yet. Maybe some memory check here?
+    ctx.response_tx
+        .as_ref()
+        .expect("ub_write found no sender")
+        .blocking_send(Bytes::from(body))
+        .unwrap();
+
+    buf.len()
+}
+
+// extern "C" fn log_message(message: *const c_char, syslog_type: c_int) {
+//     if message.is_null() {
+//         return;
+//     }
+//     let msg = unsafe { std::ffi::CStr::from_ptr(message) };
+//     let msg_str = msg.to_string_lossy();
+//     eprintln!("{msg_str}");
+// }
+//
+extern "C" fn flush(server_context: *mut c_void) {
+    // Force sending of headers. This will also flush any buffered body bytes
+    println!("flush")
+}
+
+extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
+    println!("send_headers");
+
+    let Some(ctx) = ServerContext::get_mut() else {
+        panic!("server context not set");
+    };
+
+    let mut map = HeaderMap::new();
+
+    if !sapi_headers.is_null() {
+        let sapi_headers = unsafe { &mut *sapi_headers };
+        for header in sapi_headers.headers() {
+            if let Some(value) = header.value() {
+                map.append(
+                    HeaderName::from_str(header.name()).unwrap(),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+        }
+    }
+
+    let _ = ctx.headers_tx.take().unwrap().send(map);
+
+    1 // Sent successfully
+}
+
+// extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
+//     if buffer.is_null() || length == 0 {
+//         return 0;
+//     }
+//     let Some(ctx) = ServerContext::get_mut() else {
+//         return 0;
+//     };
+//     let buf = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
+//     0
+// }
+
+extern "C" fn read_cookies() -> *mut c_char {
+    std::ptr::null_mut()
+}
+
+extern "C" fn register_server_variables(vars: *mut Zval) {
+    if vars.is_null() {
+        return;
+    }
+
+    let globals = SapiGlobals::get_mut();
+    let request_info = globals.request_info();
+
+    let mut registrar = unsafe { ServerVarRegistrar::from_raw(vars) };
+
+    registrar.register("SERVER_SOFTWARE", "ferrumphp/0.1");
+
+    if let Some(request_uri) = request_info.request_uri() {
+        registrar.register("REQUEST_URI", request_uri);
+    }
+
+    if let Some(request_method) = request_info.request_method() {
+        registrar.register("REQUEST_METHOD", request_method);
+    }
+
+    if let Some(query_string) = request_info.query_string() {
+        registrar.register("QUERY_STRING", query_string);
+    }
+}
+
+extern "C" fn deactivate() -> c_int {
+    if let Some(ctx) = ServerContext::get_mut() {
+        // signal end of request
+        ctx.response_tx = None;
+    }
+
+    ZEND_RESULT_CODE_SUCCESS
 }

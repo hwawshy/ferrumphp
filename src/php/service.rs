@@ -3,11 +3,12 @@ use bytes::Bytes;
 use futures_util::stream::{Map, StreamExt};
 use http_body_util::StreamBody;
 use hyper::body::{Frame, Incoming};
-use hyper::{Request, Response};
+use hyper::{HeaderMap, Request, Response};
 use std::error::Error;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
 use tower::Service;
@@ -51,20 +52,29 @@ impl Service<Request<Incoming>> for PhpService {
 
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
         let (tx_resp, rx_resp) = channel::<Bytes>(10);
+        let (tx_header, rx_header) = oneshot::channel::<HeaderMap>();
+
         let job = Job {
             request: req,
-            respond_to: tx_resp,
+            response_tx: tx_resp,
+            header_tx: tx_header,
         };
 
         match self.sender.send_item(job) {
-            Ok(()) => PhpFuture::Ok(Some(rx_resp)),
+            Ok(()) => PhpFuture::Ok {
+                header_rx: rx_header,
+                response_rx: Some(rx_resp),
+            },
             Err(_) => PhpFuture::Err(PhpError::ChannelClosed),
         }
     }
 }
 
 pub enum PhpFuture {
-    Ok(Option<Receiver<Bytes>>),
+    Ok {
+        response_rx: Option<Receiver<Bytes>>,
+        header_rx: oneshot::Receiver<HeaderMap>,
+    },
     Err(PhpError),
 }
 
@@ -73,14 +83,28 @@ type PhpStream = Map<ReceiverStream<Bytes>, fn(Bytes) -> Result<Frame<Bytes>, Ph
 impl Future for PhpFuture {
     type Output = Result<Response<StreamBody<PhpStream>>, PhpError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.get_mut() {
             PhpFuture::Err(e) => Poll::Ready(Err(*e)),
-            PhpFuture::Ok(rx) => {
-                let stream: PhpStream =
-                    ReceiverStream::new(rx.take().unwrap()).map(|chunk| Ok(Frame::data(chunk)));
+            PhpFuture::Ok {
+                response_rx,
+                header_rx,
+            } => {
+                tokio::pin!(header_rx);
 
-                Poll::Ready(Ok(Response::new(StreamBody::new(stream))))
+                let header_map = match header_rx.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(_)) => return Poll::Ready(Err(PhpError::ChannelClosed)),
+                    Poll::Ready(Ok(header_map)) => header_map,
+                };
+
+                let (mut parts, _) = Response::<Bytes>::default().into_parts();
+                parts.headers = header_map;
+
+                let stream: PhpStream = ReceiverStream::new(response_rx.take().unwrap())
+                    .map(|chunk| Ok(Frame::data(chunk)));
+
+                Poll::Ready(Ok(Response::from_parts(parts, StreamBody::new(stream))))
             }
         }
     }
