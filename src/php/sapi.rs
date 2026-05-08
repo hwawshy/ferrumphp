@@ -168,7 +168,14 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
 }
 
 extern "C" fn read_cookies() -> *mut c_char {
-    std::ptr::null_mut()
+    let Some(ctx) = ServerContext::get_mut() else {
+        return std::ptr::null_mut();
+    };
+
+    match ctx.cookies {
+        Some(ref cookies) => cookies.as_ptr().cast_mut(),
+        None => std::ptr::null_mut()
+    }
 }
 
 extern "C" fn register_server_variables(vars: *mut Zval) {
@@ -200,6 +207,9 @@ extern "C" fn deactivate() -> c_int {
     if let Some(ctx) = ServerContext::get_mut() {
         // signal end of request
         ctx.response_tx = None;
+        ctx.request_body = None;
+        ctx.headers_tx = None;
+        ctx.cookies = None;
     }
 
     ZEND_RESULT_CODE_SUCCESS

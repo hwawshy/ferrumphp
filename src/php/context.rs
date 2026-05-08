@@ -19,6 +19,7 @@ pub struct ServerContext {
     pub response_tx: Option<Sender<Bytes>>,
     pub headers_tx: Option<OneshotSender<HeaderMap>>,
     pub request_body: Option<Bytes>,
+    pub cookies: Option<CString>,
     _private: (),
 }
 
@@ -29,6 +30,7 @@ impl ServerContext {
             response_tx: None,
             headers_tx: None,
             request_body: None,
+            cookies: None,
             _private: (),
         }
     }
@@ -73,6 +75,12 @@ impl WorkerContext {
         let (head, body) = request.into_parts();
 
         self.server_ctx.request_body = Some(body);
+
+        self.server_ctx.cookies = head
+            .headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| CString::new(s).ok());
 
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("src/php/test.php");
