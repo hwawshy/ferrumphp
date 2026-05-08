@@ -1,4 +1,5 @@
 use crate::php::context::ServerContext;
+use crate::php::ffi::{ferrumphp_error, sapi_send_headers};
 use bytes::{Buf, Bytes};
 use ext_php_rs::builders::SapiBuilder;
 use ext_php_rs::embed::{
@@ -23,19 +24,22 @@ unsafe impl Sync for Sapi {}
 
 impl Sapi {
     pub fn new() -> Self {
-        let sapi_ptr = SapiBuilder::new("ferrumphp", "FerrumPHP")
+        let mut module = SapiBuilder::new("ferrumphp", "FerrumPHP")
             .ub_write_function(ub_write)
             .flush_function(flush)
             .deactivate_function(deactivate)
-            //.activate_function(Self::activate)
-            // .log_message_function(Self::log_message)
+            .log_message_function(log_message)
             .send_headers_function(send_headers)
             .read_post_function(read_post)
             .read_cookies_function(read_cookies)
             .register_server_variables_function(register_server_variables)
             .build()
-            .expect("Failed to build SAPI")
-            .into_raw();
+            .expect("Failed to build SAPI");
+
+        // C-variadic functions are unstable in Rust
+        module.sapi_error = Some(ferrumphp_error);
+
+        let sapi_ptr = module.into_raw();
 
         unsafe {
             ext_php_rs_sapi_startup();
@@ -77,10 +81,6 @@ impl Drop for Sapi {
     }
 }
 
-// extern "C" fn activate() -> c_int {
-//     0
-// }
-
 extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
     println!("ub_write");
 
@@ -109,25 +109,28 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
     buf.len()
 }
 
-// extern "C" fn log_message(message: *const c_char, syslog_type: c_int) {
-//     if message.is_null() {
-//         return;
-//     }
-//     let msg = unsafe { std::ffi::CStr::from_ptr(message) };
-//     let msg_str = msg.to_string_lossy();
-//     eprintln!("{msg_str}");
-// }
-//
+extern "C" fn log_message(message: *const c_char, _syslog_type: c_int) {
+    if message.is_null() {
+        return;
+    }
+    let msg = unsafe { std::ffi::CStr::from_ptr(message) };
+    let msg_str = msg.to_string_lossy();
+    eprintln!("{msg_str}");
+}
+
 extern "C" fn flush(server_context: *mut c_void) {
-    // Force sending of headers. This will also flush any buffered body bytes
-    println!("flush")
+    // Force sending of headers, which will also flush any buffered body bytes
+    println!("flush");
+    unsafe {
+        sapi_send_headers();
+    }
 }
 
 extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
     println!("send_headers");
 
     let Some(ctx) = ServerContext::get_mut() else {
-        panic!("server context not set");
+        return 1;
     };
 
     let mut map = HeaderMap::new();
@@ -174,7 +177,7 @@ extern "C" fn read_cookies() -> *mut c_char {
 
     match ctx.cookies {
         Some(ref cookies) => cookies.as_ptr().cast_mut(),
-        None => std::ptr::null_mut()
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -205,11 +208,7 @@ extern "C" fn register_server_variables(vars: *mut Zval) {
 
 extern "C" fn deactivate() -> c_int {
     if let Some(ctx) = ServerContext::get_mut() {
-        // signal end of request
-        ctx.response_tx = None;
-        ctx.request_body = None;
-        ctx.headers_tx = None;
-        ctx.cookies = None;
+        ctx.finish_request();
     }
 
     ZEND_RESULT_CODE_SUCCESS

@@ -8,6 +8,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Sender as OneshotSender;
 
 mod context;
+mod ffi;
 mod sapi;
 pub mod service;
 mod worker;

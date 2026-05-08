@@ -35,6 +35,13 @@ impl ServerContext {
         }
     }
 
+    pub fn finish_request(&mut self) {
+        self.response_tx = None;
+        self.request_body = None;
+        self.headers_tx = None;
+        self.cookies = None;
+    }
+
     pub fn get_mut() -> Option<&'static mut Self> {
         let globals = unsafe { ext_php_rs_sapi_globals().as_mut() }.expect("Invalid SAPI globals");
 
