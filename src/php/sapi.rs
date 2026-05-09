@@ -1,12 +1,12 @@
 use crate::php::context::ServerContext;
-use crate::php::ffi::{ferrumphp_error, sapi_send_headers};
+use crate::php::ffi::{ferrumphp_error, php_handle_aborted_connection, sapi_send_headers};
 use bytes::{Buf, Bytes};
 use ext_php_rs::builders::SapiBuilder;
 use ext_php_rs::embed::{
     SapiModule, ServerVarRegistrar, ext_php_rs_sapi_shutdown, ext_php_rs_sapi_startup,
 };
 use ext_php_rs::ffi::{
-    ZEND_RESULT_CODE_SUCCESS, php_module_shutdown, php_module_startup, sapi_header_struct,
+    ZEND_RESULT_CODE_FAILURE, ZEND_RESULT_CODE_SUCCESS, php_module_shutdown, php_module_startup,
     sapi_headers_struct, sapi_shutdown, sapi_startup,
 };
 use ext_php_rs::types::Zval;
@@ -16,6 +16,20 @@ use hyper::header::{HeaderName, HeaderValue};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::io::Read;
 use std::str::FromStr;
+
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum SapiHeaderSendResult {
+    SendFailed = 3,
+    //DoSend = 2,
+    SentSuccessfully = 1,
+}
+
+impl From<SapiHeaderSendResult> for c_int {
+    fn from(value: SapiHeaderSendResult) -> Self {
+        value as c_int
+    }
+}
 
 pub struct Sapi(*mut SapiModule);
 
@@ -100,11 +114,15 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
     );
 
     // This will buffer if headers are not sent yet. Maybe some memory check here?
-    ctx.response_tx
-        .as_ref()
-        .expect("ub_write found no sender")
-        .blocking_send(Bytes::from(body))
-        .unwrap();
+    let sender = ctx.response_tx.as_ref().expect("ub_write found no sender");
+
+    if let Err(_) = sender.blocking_send(Bytes::from(body)) {
+        unsafe {
+            php_handle_aborted_connection();
+        }
+
+        return 0;
+    }
 
     buf.len()
 }
@@ -118,19 +136,28 @@ extern "C" fn log_message(message: *const c_char, _syslog_type: c_int) {
     eprintln!("{msg_str}");
 }
 
-extern "C" fn flush(server_context: *mut c_void) {
+extern "C" fn flush(_server_context: *mut c_void) {
     // Force sending of headers, which will also flush any buffered body bytes
     println!("flush");
-    unsafe {
-        sapi_send_headers();
+
+    if let Some(_) = ServerContext::get_mut() {
+        // Our send_headers fails on client disconnection
+        if unsafe { sapi_send_headers() } == ZEND_RESULT_CODE_FAILURE {
+            unsafe { php_handle_aborted_connection() }
+        }
     }
 }
 
 extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
     println!("send_headers");
 
+    if SapiGlobals::get_mut().request_info().no_headers {
+        return SapiHeaderSendResult::SentSuccessfully.into();
+    }
+
     let Some(ctx) = ServerContext::get_mut() else {
-        return 1;
+        // @todo when can this happen? panic here?
+        return SapiHeaderSendResult::SendFailed.into();
     };
 
     let mut map = HeaderMap::new();
@@ -138,18 +165,32 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
     if !sapi_headers.is_null() {
         let sapi_headers = unsafe { &mut *sapi_headers };
         for header in sapi_headers.headers() {
-            if let Some(value) = header.value() {
-                map.append(
-                    HeaderName::from_str(header.name()).unwrap(),
-                    HeaderValue::from_str(value).unwrap(),
-                );
+            let Some(value) = header.value() else {
+                continue;
+            };
+
+            if let Ok(name) = HeaderName::from_str(header.name())
+                && let Ok(value) = HeaderValue::from_str(value)
+            {
+                map.append(name, value);
             }
         }
     }
 
-    let _ = ctx.headers_tx.take().unwrap().send(map);
+    // send_headers maybe called multiple times upon failure
+    let Some(sender) = ctx.headers_tx.take() else {
+        return SapiHeaderSendResult::SendFailed.into();
+    };
 
-    1 // Sent successfully
+    if let Err(_) = sender.send(map) {
+        // Future dropped together with receiver. Happens when client disconnects
+        // Should we call php_handle_aborted_connection here?
+        // unsafe { php_handle_aborted_connection(); }
+
+        return SapiHeaderSendResult::SendFailed.into();
+    }
+
+    SapiHeaderSendResult::SentSuccessfully.into()
 }
 
 extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
@@ -158,6 +199,7 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
     }
 
     let Some(ctx) = ServerContext::get_mut() else {
+        // @todo when can this happen? panic here?
         return 0;
     };
 
@@ -207,6 +249,7 @@ extern "C" fn register_server_variables(vars: *mut Zval) {
 }
 
 extern "C" fn deactivate() -> c_int {
+    println!("deactivate");
     if let Some(ctx) = ServerContext::get_mut() {
         ctx.finish_request();
     }
