@@ -18,7 +18,12 @@ impl Worker {
                     break;
                 };
 
-                ctx.handle_request(job.request, job.response_tx, job.header_tx);
+                ctx.handle_request(
+                    job.request_head,
+                    job.request_body_rx,
+                    job.response_header_tx,
+                    job.response_body_tx,
+                );
             }
         });
 

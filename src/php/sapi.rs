@@ -107,16 +107,17 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
 
     let buf = unsafe { std::slice::from_raw_parts(str.cast::<u8>(), str_length) };
 
-    let body = format!(
-        "{} from Worker #{}",
-        String::from_utf8_lossy(buf).to_string(),
-        ctx.worker_id
-    );
+    // let body = format!(
+    //     "{} from Worker #{}",
+    //     String::from_utf8_lossy(buf).to_string(),
+    //     ctx.worker_id
+    // );
 
     // This will buffer if headers are not sent yet. Maybe some memory check here?
     let sender = ctx.response_tx.as_ref().expect("ub_write found no sender");
 
-    if let Err(_) = sender.blocking_send(Bytes::from(body)) {
+    if let Err(_) = sender.blocking_send(Bytes::from(buf)) {
+        println!("aborted connection");
         unsafe {
             php_handle_aborted_connection();
         }
@@ -177,16 +178,13 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
         }
     }
 
-    // send_headers maybe called multiple times upon failure
+    // send_headers may be called multiple times upon failure
     let Some(sender) = ctx.headers_tx.take() else {
         return SapiHeaderSendResult::SendFailed.into();
     };
 
     if let Err(_) = sender.send(map) {
         // Future dropped together with receiver. Happens when client disconnects
-        // Should we call php_handle_aborted_connection here?
-        // unsafe { php_handle_aborted_connection(); }
-
         return SapiHeaderSendResult::SendFailed.into();
     }
 
@@ -194,6 +192,8 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
 }
 
 extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
+    println!("read_post");
+
     if buffer.is_null() || length == 0 {
         return 0;
     }
@@ -203,13 +203,39 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
         return 0;
     };
 
-    let Some(ref mut body) = ctx.request_body else {
+    let Some(ref mut body_rx) = ctx.request_body_rx else {
+        // @todo when can this happen? panic here?
         return 0;
     };
 
     let buf = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
 
-    body.reader().read(buf).unwrap_or_else(|_| 0)
+    let mut written = 0;
+
+    // one PHP read may consume multiple chunks
+    // one chunk may span multiple PHP reads
+    while written < buf.len() {
+        if ctx.current_request_body_chunk.is_none() {
+            ctx.current_request_body_chunk = match body_rx.blocking_recv() {
+                None => break,
+                Some(chunk) => Some(chunk),
+            }
+        }
+
+        let chunk = ctx.current_request_body_chunk.as_mut().unwrap();
+        let to_read = chunk.len().min(buf.len() - written);
+
+        written += match chunk.reader().read(&mut buf[written..written + to_read]) {
+            Err(_) => break,
+            Ok(n) => n,
+        };
+
+        if chunk.len() == 0 {
+            ctx.current_request_body_chunk = None;
+        }
+    }
+
+    written
 }
 
 extern "C" fn read_cookies() -> *mut c_char {

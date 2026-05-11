@@ -1,10 +1,8 @@
 use crate::php::Job;
 use bytes::Bytes;
 use futures_util::stream::{Map, StreamExt};
-use http_body_util::combinators::Collect;
-use http_body_util::{BodyExt, Collected, StreamBody};
-use hyper::body::{Frame, Incoming};
-use hyper::http::request::Parts;
+use http_body_util::StreamBody;
+use hyper::body::{Body, Frame, Incoming};
 use hyper::{HeaderMap, Request, Response};
 use std::error::Error;
 use std::fmt::Display;
@@ -19,13 +17,13 @@ use tower::Service;
 
 #[derive(Clone)]
 pub struct PhpService {
-    sender: Option<PollSender<Job>>,
+    sender: PollSender<Job>,
 }
 
 impl PhpService {
     pub fn new(sender: Sender<Job>) -> Self {
         Self {
-            sender: Some(PollSender::new(sender)),
+            sender: PollSender::new(sender),
         }
     }
 }
@@ -52,8 +50,8 @@ impl From<hyper::Error> for PhpError {
     }
 }
 
-impl From<PollSendError<Job>> for PhpError {
-    fn from(_: PollSendError<Job>) -> Self {
+impl<T> From<PollSendError<T>> for PhpError {
+    fn from(_: PollSendError<T>) -> Self {
         PhpError::JobSendingFailed
     }
 }
@@ -71,8 +69,6 @@ impl Service<Request<Incoming>> for PhpService {
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.sender
-            .as_mut()
-            .expect("PollSender invalid")
             .poll_reserve(cx)
             .map_err(|_| PhpError::JobSendingFailed)
     }
@@ -80,24 +76,40 @@ impl Service<Request<Incoming>> for PhpService {
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
         let (parts, body) = req.into_parts();
 
-        PhpFuture {
-            sender: self.sender.take().expect("PollSender invalid"),
-            collect: Some(body.collect()),
-            parts: Some(parts),
-            collected: None,
-            response_rx: None,
-            header_rx: None,
+        let (request_body_tx, request_body_rx) = channel::<Bytes>(8); // @todo rethink this buffer
+        let (response_body_tx, response_body_rx) = channel::<Bytes>(10); // @todo rethink this buffer
+        let (response_header_tx, response_header_rx) = oneshot::channel::<HeaderMap>();
+
+        let job = Job {
+            request_head: parts,
+            request_body_rx,
+            response_header_tx,
+            response_body_tx,
+        };
+
+        if let Err(_) = self.sender.send_item(job) {
+            return PhpFuture::Err(PhpError::JobSendingFailed);
+        }
+
+        PhpFuture::Ok {
+            request_body: Some(body),
+            current_request_body_chunk: None,
+            request_body_tx: PollSender::new(request_body_tx),
+            response_body_rx: Some(response_body_rx),
+            response_header_rx,
         }
     }
 }
 
-pub struct PhpFuture {
-    sender: PollSender<Job>,
-    collect: Option<Collect<Incoming>>,
-    parts: Option<Parts>,
-    collected: Option<Collected<Bytes>>,
-    response_rx: Option<Receiver<Bytes>>,
-    header_rx: Option<oneshot::Receiver<HeaderMap>>,
+pub enum PhpFuture {
+    Ok {
+        request_body: Option<Incoming>,
+        current_request_body_chunk: Option<Bytes>,
+        request_body_tx: PollSender<Bytes>,
+        response_header_rx: oneshot::Receiver<HeaderMap>,
+        response_body_rx: Option<Receiver<Bytes>>,
+    },
+    Err(PhpError),
 }
 
 type PhpStream = Map<ReceiverStream<Bytes>, fn(Bytes) -> Result<Frame<Bytes>, PhpError>>;
@@ -106,48 +118,60 @@ impl Future for PhpFuture {
     type Output = Result<Response<StreamBody<PhpStream>>, PhpError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
+        match self.get_mut() {
+            PhpFuture::Err(e) => Poll::Ready(Err(*e)),
+            PhpFuture::Ok {
+                request_body,
+                request_body_tx,
+                current_request_body_chunk,
+                response_header_rx,
+                response_body_rx,
+            } => {
+                loop {
+                    match request_body {
+                        Some(body) => {
+                            match current_request_body_chunk {
+                                None => {
+                                    let frame = ready!(Pin::new(body).poll_frame(cx));
 
-        loop {
-            match this.collect {
-                Some(ref mut collect) => {
-                    this.collected = Some(ready!(Pin::new(collect).poll(cx))?);
-                    this.collect = None;
+                                    if let Some(frame) = frame {
+                                        // ignore trailers
+                                        if let Ok(data) = frame?.into_data() {
+                                            *current_request_body_chunk = Some(data);
+                                        }
+                                    } else {
+                                        // end of stream
+                                        request_body.take();
+                                        request_body_tx.close();
+                                    }
+                                }
+                                Some(_) => {
+                                    // stream body chunk
+                                    ready!(Pin::new(&mut *request_body_tx).poll_reserve(cx))?;
+
+                                    request_body_tx
+                                        .send_item(current_request_body_chunk.take().unwrap())?
+                                }
+                            }
+                        }
+                        None => {
+                            let header_map = ready!(Pin::new(response_header_rx).poll(cx))?;
+
+                            // @todo status, version
+                            let (mut parts, _) = Response::<()>::default().into_parts();
+                            parts.headers = header_map;
+
+                            let stream: PhpStream =
+                                ReceiverStream::new(response_body_rx.take().unwrap())
+                                    .map(|chunk| Ok(Frame::data(chunk)));
+
+                            return Poll::Ready(Ok(Response::from_parts(
+                                parts,
+                                StreamBody::new(stream),
+                            )));
+                        }
+                    }
                 }
-                None => match this.header_rx {
-                    None => {
-                        let (response_tx, response_rx) = channel::<Bytes>(10);
-                        let (header_tx, header_rx) = oneshot::channel::<HeaderMap>();
-
-                        let request = Request::from_parts(
-                            this.parts.take().unwrap(),
-                            this.collected.take().unwrap().to_bytes(),
-                        );
-                        this.sender.send_item(Job {
-                            request,
-                            response_tx,
-                            header_tx,
-                        })?;
-
-                        this.response_rx = Some(response_rx);
-                        this.header_rx = Some(header_rx);
-                    }
-                    Some(ref mut header_rx) => {
-                        let header_map = ready!(Pin::new(header_rx).poll(cx))?;
-
-                        let (mut parts, _) = Response::<()>::default().into_parts();
-                        parts.headers = header_map;
-
-                        let stream: PhpStream =
-                            ReceiverStream::new(this.response_rx.take().unwrap())
-                                .map(|chunk| Ok(Frame::data(chunk)));
-
-                        return Poll::Ready(Ok(Response::from_parts(
-                            parts,
-                            StreamBody::new(stream),
-                        )));
-                    }
-                },
             }
         }
     }

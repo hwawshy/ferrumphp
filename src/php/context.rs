@@ -11,14 +11,15 @@ use hyper::{HeaderMap, Request, StatusCode, Version};
 use std::ffi::{CString, NulError, c_int};
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot::Sender as OneshotSender;
 
 pub struct ServerContext {
     pub worker_id: u32,
     pub response_tx: Option<Sender<Bytes>>,
     pub headers_tx: Option<OneshotSender<HeaderMap>>,
-    pub request_body: Option<Bytes>,
+    pub request_body_rx: Option<Receiver<Bytes>>,
+    pub current_request_body_chunk: Option<Bytes>,
     pub cookies: Option<CString>,
     _private: (),
 }
@@ -29,7 +30,8 @@ impl ServerContext {
             worker_id,
             response_tx: None,
             headers_tx: None,
-            request_body: None,
+            request_body_rx: None,
+            current_request_body_chunk: None,
             cookies: None,
             _private: (),
         }
@@ -37,9 +39,10 @@ impl ServerContext {
 
     pub fn finish_request(&mut self) {
         self.response_tx = None;
-        self.request_body = None;
+        self.request_body_rx = None;
         self.headers_tx = None;
         self.cookies = None;
+        self.current_request_body_chunk = None;
     }
 
     pub fn get_mut() -> Option<&'static mut Self> {
@@ -72,18 +75,17 @@ impl WorkerContext {
 
     pub fn handle_request(
         &mut self,
-        request: Request<Bytes>,
-        response_tx: Sender<Bytes>,
+        request_head: Parts,
+        request_body_rx: Receiver<Bytes>,
         header_tx: OneshotSender<HeaderMap>,
+        response_tx: Sender<Bytes>,
     ) {
         self.server_ctx.response_tx = Some(response_tx);
         self.server_ctx.headers_tx = Some(header_tx);
 
-        let (head, body) = request.into_parts();
+        self.server_ctx.request_body_rx = Some(request_body_rx);
 
-        self.server_ctx.request_body = Some(body);
-
-        self.server_ctx.cookies = head
+        self.server_ctx.cookies = request_head
             .headers
             .get("cookie")
             .and_then(|v| v.to_str().ok())
@@ -94,7 +96,7 @@ impl WorkerContext {
 
         let filename = path.to_str().unwrap();
 
-        let request_context = PhpRequestContext::new(head, filename).unwrap();
+        let request_context = PhpRequestContext::new(request_head, filename).unwrap();
 
         request_context.execute();
     }
