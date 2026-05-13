@@ -6,18 +6,19 @@ use ext_php_rs::ffi::{
 };
 use ext_php_rs::zend::SapiGlobals;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use hyper::http::request::Parts;
-use hyper::{HeaderMap, Request, StatusCode, Version};
+use hyper::http::request::Parts as RequestParts;
+use hyper::{HeaderMap, StatusCode, Version};
 use std::ffi::{CString, NulError, c_int};
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
+use hyper::http::response::Parts as ResponseParts;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot::Sender as OneshotSender;
 
 pub struct ServerContext {
     pub worker_id: u32,
     pub response_tx: Option<Sender<Bytes>>,
-    pub headers_tx: Option<OneshotSender<HeaderMap>>,
+    pub head_tx: Option<OneshotSender<ResponseParts>>,
     pub request_body_rx: Option<Receiver<Bytes>>,
     pub current_request_body_chunk: Option<Bytes>,
     pub cookies: Option<CString>,
@@ -29,7 +30,7 @@ impl ServerContext {
         Self {
             worker_id,
             response_tx: None,
-            headers_tx: None,
+            head_tx: None,
             request_body_rx: None,
             current_request_body_chunk: None,
             cookies: None,
@@ -40,7 +41,7 @@ impl ServerContext {
     pub fn finish_request(&mut self) {
         self.response_tx = None;
         self.request_body_rx = None;
-        self.headers_tx = None;
+        self.head_tx = None;
         self.cookies = None;
         self.current_request_body_chunk = None;
     }
@@ -75,13 +76,13 @@ impl WorkerContext {
 
     pub fn handle_request(
         &mut self,
-        request_head: Parts,
+        request_head: RequestParts,
         request_body_rx: Receiver<Bytes>,
-        header_tx: OneshotSender<HeaderMap>,
+        header_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
     ) {
         self.server_ctx.response_tx = Some(response_tx);
-        self.server_ctx.headers_tx = Some(header_tx);
+        self.server_ctx.head_tx = Some(header_tx);
 
         self.server_ctx.request_body_rx = Some(request_body_rx);
 
@@ -124,7 +125,7 @@ struct PhpRequestContext {
 
 impl PhpRequestContext {
     // @TODO validation and suitable error type
-    pub fn new(head: Parts, filename: &str) -> Result<Self, NulError> {
+    pub fn new(head: RequestParts, filename: &str) -> Result<Self, NulError> {
         let filename = CString::new(filename)?;
 
         let method = CString::new(head.method.as_str())?;
@@ -182,11 +183,9 @@ impl PhpRequestContext {
             let mut file_handle = file_handle.assume_init();
             file_handle.primary_script = true;
 
-            if !php_execute_script(&mut file_handle) {
-                panic!("error executing script");
-            }
+            php_execute_script(&raw mut file_handle);
 
-            zend_destroy_file_handle(&mut file_handle);
+            zend_destroy_file_handle(&raw mut file_handle);
 
             php_request_shutdown(std::ptr::null_mut());
         }

@@ -1,9 +1,10 @@
 use crate::php::sapi::Sapi;
 use crate::php::worker::Worker;
 use bytes::Bytes;
-use hyper::http::request::Parts;
+use hyper::http::request::Parts as RequestParts;
 use hyper::{HeaderMap, Request, Response};
 use std::thread::JoinHandle;
+use hyper::http::response::Parts as ResponseParts;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Sender as OneshotSender;
@@ -15,9 +16,9 @@ pub mod service;
 mod worker;
 
 pub struct Job {
-    pub request_head: Parts,
+    pub request_head: RequestParts,
     pub request_body_rx: Receiver<Bytes>,
-    pub response_header_tx: OneshotSender<HeaderMap>,
+    pub response_head_tx: OneshotSender<ResponseParts>,
     pub response_body_tx: Sender<Bytes>,
 }
 

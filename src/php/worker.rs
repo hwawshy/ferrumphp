@@ -21,7 +21,7 @@ impl Worker {
                 ctx.handle_request(
                     job.request_head,
                     job.request_body_rx,
-                    job.response_header_tx,
+                    job.response_head_tx,
                     job.response_body_tx,
                 );
             }

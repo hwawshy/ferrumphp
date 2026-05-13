@@ -3,11 +3,12 @@ use bytes::Bytes;
 use futures_util::stream::{Map, StreamExt};
 use http_body_util::StreamBody;
 use hyper::body::{Body, Frame, Incoming};
-use hyper::{HeaderMap, Request, Response};
+use hyper::{Request, Response};
 use std::error::Error;
 use std::fmt::Display;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
+use hyper::http::response::Parts;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
@@ -78,12 +79,12 @@ impl Service<Request<Incoming>> for PhpService {
 
         let (request_body_tx, request_body_rx) = channel::<Bytes>(8); // @todo rethink this buffer
         let (response_body_tx, response_body_rx) = channel::<Bytes>(10); // @todo rethink this buffer
-        let (response_header_tx, response_header_rx) = oneshot::channel::<HeaderMap>();
+        let (response_head_tx, response_header_rx) = oneshot::channel::<Parts>();
 
         let job = Job {
             request_head: parts,
             request_body_rx,
-            response_header_tx,
+            response_head_tx,
             response_body_tx,
         };
 
@@ -96,7 +97,7 @@ impl Service<Request<Incoming>> for PhpService {
             current_request_body_chunk: None,
             request_body_tx: PollSender::new(request_body_tx),
             response_body_rx: Some(response_body_rx),
-            response_header_rx,
+            response_head_rx: response_header_rx,
         }
     }
 }
@@ -106,7 +107,7 @@ pub enum PhpFuture {
         request_body: Option<Incoming>,
         current_request_body_chunk: Option<Bytes>,
         request_body_tx: PollSender<Bytes>,
-        response_header_rx: oneshot::Receiver<HeaderMap>,
+        response_head_rx: oneshot::Receiver<Parts>,
         response_body_rx: Option<Receiver<Bytes>>,
     },
     Err(PhpError),
@@ -124,7 +125,7 @@ impl Future for PhpFuture {
                 request_body,
                 request_body_tx,
                 current_request_body_chunk,
-                response_header_rx,
+                response_head_rx,
                 response_body_rx,
             } => {
                 loop {
@@ -155,11 +156,7 @@ impl Future for PhpFuture {
                             }
                         }
                         None => {
-                            let header_map = ready!(Pin::new(response_header_rx).poll(cx))?;
-
-                            // @todo status, version
-                            let (mut parts, _) = Response::<()>::default().into_parts();
-                            parts.headers = header_map;
+                            let parts = ready!(Pin::new(response_head_rx).poll(cx))?;
 
                             let stream: PhpStream =
                                 ReceiverStream::new(response_body_rx.take().unwrap())

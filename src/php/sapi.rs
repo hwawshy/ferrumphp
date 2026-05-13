@@ -11,9 +11,9 @@ use ext_php_rs::ffi::{
 };
 use ext_php_rs::types::Zval;
 use ext_php_rs::zend::SapiGlobals;
-use hyper::HeaderMap;
+use hyper::{HeaderMap, Response, StatusCode};
 use hyper::header::{HeaderName, HeaderValue};
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CString, c_char, c_int, c_void, CStr};
 use std::io::Read;
 use std::str::FromStr;
 
@@ -161,10 +161,33 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
         return SapiHeaderSendResult::SendFailed.into();
     };
 
+    // send_headers may be called multiple times upon failure
+    let Some(sender) = ctx.head_tx.take() else {
+        return SapiHeaderSendResult::SendFailed.into();
+    };
+
     let mut map = HeaderMap::new();
+    let mut status: Option<StatusCode> = None;
 
     if !sapi_headers.is_null() {
         let sapi_headers = unsafe { &mut *sapi_headers };
+
+        if !sapi_headers.http_status_line.is_null() {
+            let line = unsafe { CStr::from_ptr(sapi_headers.http_status_line) }
+                .to_bytes();
+
+            status = line.iter().position(|&b| b == b' ').and_then(|i| {
+                let rest = &line[i + 1..];
+                rest.iter().position(|&b| b == b' ').and_then(|j| {
+                    StatusCode::from_bytes(&rest[..j]).ok()
+                })
+            });
+        }
+
+        if status.is_none() {
+            status = StatusCode::from_u16(sapi_headers.http_response_code as u16).ok()
+        }
+
         for header in sapi_headers.headers() {
             let Some(value) = header.value() else {
                 continue;
@@ -178,12 +201,12 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
         }
     }
 
-    // send_headers may be called multiple times upon failure
-    let Some(sender) = ctx.headers_tx.take() else {
-        return SapiHeaderSendResult::SendFailed.into();
-    };
+    let (mut parts, _) = Response::new(()).into_parts();
 
-    if let Err(_) = sender.send(map) {
+    parts.headers = map;
+    parts.status = status.unwrap_or(StatusCode::OK);
+
+    if let Err(_) = sender.send(parts) {
         // Future dropped together with receiver. Happens when client disconnects
         return SapiHeaderSendResult::SendFailed.into();
     }
@@ -216,13 +239,13 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
     // one chunk may span multiple PHP reads
     while written < buf.len() {
         if ctx.current_request_body_chunk.is_none() {
-            ctx.current_request_body_chunk = match body_rx.blocking_recv() {
-                None => break,
-                Some(chunk) => Some(chunk),
-            }
+            ctx.current_request_body_chunk = body_rx.blocking_recv();
         }
 
-        let chunk = ctx.current_request_body_chunk.as_mut().unwrap();
+        let Some(ref mut chunk) = ctx.current_request_body_chunk else {
+            break;
+        };
+
         let to_read = chunk.len().min(buf.len() - written);
 
         written += match chunk.reader().read(&mut buf[written..written + to_read]) {
@@ -230,7 +253,7 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
             Ok(n) => n,
         };
 
-        if chunk.len() == 0 {
+        if chunk.is_empty() {
             ctx.current_request_body_chunk = None;
         }
     }
