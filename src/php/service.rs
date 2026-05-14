@@ -3,12 +3,12 @@ use bytes::Bytes;
 use futures_util::stream::{Map, StreamExt};
 use http_body_util::StreamBody;
 use hyper::body::{Body, Frame, Incoming};
+use hyper::http::response::Parts;
 use hyper::{Request, Response};
 use std::error::Error;
 use std::fmt::Display;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
-use hyper::http::response::Parts;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
@@ -35,6 +35,7 @@ pub enum PhpError {
     Hyper,
     JobSendingFailed,
     HeaderChannelClosed,
+    ExecutionError,
 }
 
 impl Display for PhpError {
@@ -79,7 +80,7 @@ impl Service<Request<Incoming>> for PhpService {
 
         let (request_body_tx, request_body_rx) = channel::<Bytes>(8); // @todo rethink this buffer
         let (response_body_tx, response_body_rx) = channel::<Bytes>(10); // @todo rethink this buffer
-        let (response_head_tx, response_header_rx) = oneshot::channel::<Parts>();
+        let (response_head_tx, response_head_rx) = oneshot::channel::<Parts>();
 
         let job = Job {
             request_head: parts,
@@ -97,7 +98,7 @@ impl Service<Request<Incoming>> for PhpService {
             current_request_body_chunk: None,
             request_body_tx: PollSender::new(request_body_tx),
             response_body_rx: Some(response_body_rx),
-            response_head_rx: response_header_rx,
+            response_head_rx,
         }
     }
 }

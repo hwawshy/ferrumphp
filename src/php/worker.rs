@@ -14,17 +14,21 @@ impl Worker {
 
             loop {
                 let Ok(job) = rx.recv() else {
-                    println!("Worker {} shutting down", id);
                     break;
                 };
 
-                ctx.handle_request(
+                if let Err(_) = ctx.handle_request(
                     job.request_head,
                     job.request_body_rx,
                     job.response_head_tx,
                     job.response_body_tx,
-                );
+                ) {
+                    // @todo signal shutdown to pool
+                    break;
+                }
             }
+
+            println!("Worker {} shutting down", id);
         });
 
         Self { handle }

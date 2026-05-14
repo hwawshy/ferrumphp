@@ -11,9 +11,9 @@ use ext_php_rs::ffi::{
 };
 use ext_php_rs::types::Zval;
 use ext_php_rs::zend::SapiGlobals;
-use hyper::{HeaderMap, Response, StatusCode};
 use hyper::header::{HeaderName, HeaderValue};
-use std::ffi::{CString, c_char, c_int, c_void, CStr};
+use hyper::{HeaderMap, Response, StatusCode};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::Read;
 use std::str::FromStr;
 
@@ -132,7 +132,7 @@ extern "C" fn log_message(message: *const c_char, _syslog_type: c_int) {
     if message.is_null() {
         return;
     }
-    let msg = unsafe { std::ffi::CStr::from_ptr(message) };
+    let msg = unsafe { CStr::from_ptr(message) };
     let msg_str = msg.to_string_lossy();
     eprintln!("{msg_str}");
 }
@@ -173,14 +173,13 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
         let sapi_headers = unsafe { &mut *sapi_headers };
 
         if !sapi_headers.http_status_line.is_null() {
-            let line = unsafe { CStr::from_ptr(sapi_headers.http_status_line) }
-                .to_bytes();
+            let line = unsafe { CStr::from_ptr(sapi_headers.http_status_line) }.to_bytes();
 
             status = line.iter().position(|&b| b == b' ').and_then(|i| {
                 let rest = &line[i + 1..];
-                rest.iter().position(|&b| b == b' ').and_then(|j| {
-                    StatusCode::from_bytes(&rest[..j]).ok()
-                })
+                rest.iter()
+                    .position(|&b| b == b' ')
+                    .and_then(|j| StatusCode::from_bytes(&rest[..j]).ok())
             });
         }
 

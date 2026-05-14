@@ -4,14 +4,15 @@ use ext_php_rs::ffi::{
     ZEND_RESULT_CODE_SUCCESS, ext_php_rs_sapi_globals, php_execute_script, php_request_shutdown,
     php_request_startup, zend_destroy_file_handle, zend_file_handle, zend_stream_init_filename,
 };
-use ext_php_rs::zend::SapiGlobals;
+use ext_php_rs::zend::{SapiGlobals, try_catch, try_catch_first};
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::http::request::Parts as RequestParts;
-use hyper::{HeaderMap, StatusCode, Version};
+use hyper::http::response::Parts as ResponseParts;
+use hyper::{StatusCode, Version};
 use std::ffi::{CString, NulError, c_int};
 use std::mem::MaybeUninit;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use hyper::http::response::Parts as ResponseParts;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot::Sender as OneshotSender;
 
@@ -44,6 +45,25 @@ impl ServerContext {
         self.head_tx = None;
         self.cookies = None;
         self.current_request_body_chunk = None;
+    }
+
+    fn start_request(
+        &mut self,
+        request_head: &RequestParts,
+        request_body_rx: Receiver<Bytes>,
+        header_tx: OneshotSender<ResponseParts>,
+        response_tx: Sender<Bytes>,
+    ) {
+        self.response_tx = Some(response_tx);
+        self.head_tx = Some(header_tx);
+
+        self.request_body_rx = Some(request_body_rx);
+
+        self.cookies = request_head
+            .headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| CString::new(s).ok());
     }
 
     pub fn get_mut() -> Option<&'static mut Self> {
@@ -80,17 +100,9 @@ impl WorkerContext {
         request_body_rx: Receiver<Bytes>,
         header_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
-    ) {
-        self.server_ctx.response_tx = Some(response_tx);
-        self.server_ctx.head_tx = Some(header_tx);
-
-        self.server_ctx.request_body_rx = Some(request_body_rx);
-
-        self.server_ctx.cookies = request_head
-            .headers
-            .get("cookie")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| CString::new(s).ok());
+    ) -> Result<(), ()> {
+        self.server_ctx
+            .start_request(&request_head, request_body_rx, header_tx, response_tx);
 
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("src/php/test.php");
@@ -99,7 +111,13 @@ impl WorkerContext {
 
         let request_context = PhpRequestContext::new(request_head, filename).unwrap();
 
-        request_context.execute();
+        if let Err(_) = unsafe { request_context.execute() } {
+            self.server_ctx.finish_request();
+
+            return Err(());
+        }
+
+        Ok(())
     }
 }
 
@@ -168,26 +186,56 @@ impl PhpRequestContext {
         })
     }
 
-    pub fn execute(&self) {
+    unsafe fn execute(&self) -> Result<(), ()> {
+        unsafe { self.populate_request_info() };
+
+        let mut attempted_shutdown = false;
+
+        let mut file_handle = MaybeUninit::<zend_file_handle>::uninit();
+
         unsafe {
-            self.populate_request_info();
-
-            if php_request_startup() != ZEND_RESULT_CODE_SUCCESS {
-                panic!("request startup failed");
-            }
-
-            let mut file_handle = MaybeUninit::<zend_file_handle>::uninit();
-
             zend_stream_init_filename(file_handle.as_mut_ptr(), self.filename.as_ptr());
+        };
 
-            let mut file_handle = file_handle.assume_init();
-            file_handle.primary_script = true;
+        let mut file_handle = unsafe { file_handle.assume_init() };
+        file_handle.primary_script = true;
+
+        let result = try_catch_first(AssertUnwindSafe(|| unsafe {
+            if php_request_startup() != ZEND_RESULT_CODE_SUCCESS {
+                return false;
+            }
 
             php_execute_script(&raw mut file_handle);
 
+            // PHP expects this to be called before request shutdown
             zend_destroy_file_handle(&raw mut file_handle);
 
+            attempted_shutdown = true;
+
             php_request_shutdown(std::ptr::null_mut());
+
+            true
+        }));
+
+        match result {
+            Err(_) => { // bailout
+                if !attempted_shutdown {
+                    // @todo look into freeing last_error_message if shutdown bails out
+                    let _ = try_catch(AssertUnwindSafe(|| unsafe {
+                        zend_destroy_file_handle(&raw mut file_handle);
+
+                        php_request_shutdown(std::ptr::null_mut());
+                    }));
+                }
+
+                Err(())
+            }
+            Ok(false) => { // request startup failed
+                unsafe { zend_destroy_file_handle(&raw mut file_handle) };
+
+                Err(())
+            },
+            Ok(true) => Ok(()),
         }
     }
 
@@ -220,6 +268,7 @@ impl Drop for PhpRequestContext {
 
         sapi_globals.request_info.request_method = std::ptr::null();
         sapi_globals.request_info.request_uri = std::ptr::null_mut();
+        sapi_globals.request_info.cookie_data = std::ptr::null_mut();
 
         sapi_globals.request_info.query_string = std::ptr::null_mut();
         sapi_globals.request_info.content_length = 0;
