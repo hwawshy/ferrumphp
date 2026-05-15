@@ -4,7 +4,7 @@ use ext_php_rs::ffi::{
     ZEND_RESULT_CODE_SUCCESS, ext_php_rs_sapi_globals, php_execute_script, php_request_shutdown,
     php_request_startup, zend_destroy_file_handle, zend_file_handle, zend_stream_init_filename,
 };
-use ext_php_rs::zend::{SapiGlobals, try_catch, try_catch_first};
+use ext_php_rs::zend::{SapiGlobals, try_catch, try_catch_first, bailout};
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::http::request::Parts as RequestParts;
 use hyper::http::response::Parts as ResponseParts;
@@ -218,7 +218,8 @@ impl PhpRequestContext {
         }));
 
         match result {
-            Err(_) => { // bailout
+            Err(_) => {
+                // bailout
                 if !attempted_shutdown {
                     // @todo look into freeing last_error_message if shutdown bails out
                     let _ = try_catch(AssertUnwindSafe(|| unsafe {
@@ -230,11 +231,12 @@ impl PhpRequestContext {
 
                 Err(())
             }
-            Ok(false) => { // request startup failed
+            Ok(false) => {
+                // request startup failed
                 unsafe { zend_destroy_file_handle(&raw mut file_handle) };
 
                 Err(())
-            },
+            }
             Ok(true) => Ok(()),
         }
     }
