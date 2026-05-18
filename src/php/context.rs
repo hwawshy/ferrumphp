@@ -50,14 +50,14 @@ impl ServerContext {
     fn start_request(
         &mut self,
         request_head: &RequestParts,
-        request_body_rx: Receiver<Bytes>,
+        request_body_rx: Option<Receiver<Bytes>>,
         header_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
     ) {
         self.response_tx = Some(response_tx);
         self.head_tx = Some(header_tx);
 
-        self.request_body_rx = Some(request_body_rx);
+        self.request_body_rx = request_body_rx;
 
         self.cookies = request_head
             .headers
@@ -97,7 +97,7 @@ impl WorkerContext {
     pub fn handle_request(
         &mut self,
         request_head: RequestParts,
-        request_body_rx: Receiver<Bytes>,
+        request_body_rx: Option<Receiver<Bytes>>,
         header_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
     ) -> Result<(), ()> {

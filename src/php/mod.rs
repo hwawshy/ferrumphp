@@ -17,7 +17,7 @@ mod worker;
 
 pub struct Job {
     pub request_head: RequestParts,
-    pub request_body_rx: Receiver<Bytes>,
+    pub request_body_rx: Option<Receiver<Bytes>>,
     pub response_head_tx: OneshotSender<ResponseParts>,
     pub response_body_tx: Sender<Bytes>,
 }
