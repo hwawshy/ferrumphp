@@ -2,18 +2,18 @@ use crate::php::Job;
 use bytes::Bytes;
 use futures_util::stream::{Map, StreamExt};
 use http_body_util::StreamBody;
+use hyper::Error as HyperError;
 use hyper::body::{Body, Frame, Incoming};
 use hyper::http::response::Parts;
 use hyper::{Request, Response};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use thiserror::Error;
-use hyper::Error as HyperError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::{PollSender};
+use tokio_util::sync::PollSender;
 use tower::Service;
 
 #[derive(Clone)]
@@ -72,7 +72,7 @@ impl Service<Request<Incoming>> for PhpService {
 
             let fut = PhpFuture::WaitingResponse {
                 response_body_rx,
-                response_head_rx
+                response_head_rx,
             };
 
             (job, fut)
@@ -121,7 +121,7 @@ pub enum PhpFuture {
         response_body_rx: Receiver<Bytes>,
     },
     Err(PhpError),
-    Done
+    Done,
 }
 
 impl PhpFuture {
@@ -134,19 +134,19 @@ impl PhpFuture {
             } => {
                 *self = PhpFuture::WaitingResponse {
                     response_head_rx,
-                    response_body_rx
+                    response_body_rx,
                 }
-            },
-            _ => unreachable!()
+            }
+            _ => unreachable!(),
         }
     }
 
     fn transition_to_done(&mut self) -> Receiver<Bytes> {
         match std::mem::replace(self, PhpFuture::Done) {
-            PhpFuture::WaitingResponse { response_body_rx, ..} => {
-                response_body_rx
-            },
-            _ => unreachable!()
+            PhpFuture::WaitingResponse {
+                response_body_rx, ..
+            } => response_body_rx,
+            _ => unreachable!(),
         }
     }
 }
@@ -159,11 +159,9 @@ impl Future for PhpFuture {
         loop {
             match this {
                 PhpFuture::Done => panic!("PhpFuture polled after completion"),
-                PhpFuture::Err(_) => {
-                    match std::mem::replace(this, PhpFuture::Done) {
-                        PhpFuture::Err(e) => return Poll::Ready(Err(e)),
-                        _ => unreachable!()
-                    }
+                PhpFuture::Err(_) => match std::mem::replace(this, PhpFuture::Done) {
+                    PhpFuture::Err(e) => return Poll::Ready(Err(e)),
+                    _ => unreachable!(),
                 },
                 PhpFuture::StreamingRequest {
                     request_body,
@@ -188,28 +186,26 @@ impl Future for PhpFuture {
                         }
                         Some(_) => {
                             // stream body chunk
-                            ready!(Pin::new(&mut *request_body_tx).poll_reserve(cx)).map_err(|_| PhpError::RequestBodyClosed)?;
+                            ready!(Pin::new(&mut *request_body_tx).poll_reserve(cx))
+                                .map_err(|_| PhpError::RequestBodyClosed)?;
 
                             request_body_tx
-                                .send_item(current_request_body_chunk.take().unwrap()).map_err(|_| PhpError::RequestBodyClosed)?
+                                .send_item(current_request_body_chunk.take().unwrap())
+                                .map_err(|_| PhpError::RequestBodyClosed)?
                         }
                     }
-                },
+                }
                 PhpFuture::WaitingResponse {
-                    response_head_rx,
-                    ..
+                    response_head_rx, ..
                 } => {
-                    let parts = ready!(Pin::new(response_head_rx).poll(cx)).map_err(|e| PhpError::ResponseHeadClosed(e))?;
+                    let parts = ready!(Pin::new(response_head_rx).poll(cx))
+                        .map_err(|e| PhpError::ResponseHeadClosed(e))?;
                     let response_body_rx = this.transition_to_done();
 
                     let stream: PhpStream =
-                        ReceiverStream::new(response_body_rx)
-                            .map(|chunk| Ok(Frame::data(chunk)));
+                        ReceiverStream::new(response_body_rx).map(|chunk| Ok(Frame::data(chunk)));
 
-                    return Poll::Ready(Ok(Response::from_parts(
-                        parts,
-                        StreamBody::new(stream),
-                    )));
+                    return Poll::Ready(Ok(Response::from_parts(parts, StreamBody::new(stream))));
                 }
             }
         }
