@@ -27,14 +27,14 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
-    pub fn new(mut receiver: Receiver<Job>) -> Self {
+    pub fn new(num_workers: usize, mut receiver: Receiver<Job>) -> Self {
         let handle = std::thread::Builder::new()
             .name("SAPI worker".to_string())
             .spawn(move || {
                 let _sapi = Sapi::new();
 
                 let (tx_req, rx_req) = crossbeam_channel::bounded::<Job>(0);
-                let supervisor = WorkerSupervisor::new(rx_req.clone());
+                let supervisor = WorkerSupervisor::new(num_workers, rx_req.clone());
 
                 while let Some(r) = receiver.blocking_recv() {
                     if tx_req.send(r).is_err() {
@@ -71,14 +71,14 @@ struct WorkerSupervisor {
 }
 
 impl WorkerSupervisor {
-    fn new(job_receiver: crossbeam_channel::Receiver<Job>) -> Self {
+    fn new(num_workers: usize, job_receiver: crossbeam_channel::Receiver<Job>) -> Self {
         let handle = std::thread::Builder::new()
             .name("Worker supervisor".to_string())
             .spawn(move || {
                 let mut workers: HashMap<usize, Worker> = HashMap::with_capacity(10);
                 let (event_tx, event_rx) = std::sync::mpsc::sync_channel(10); // @todo rethink this buffer
 
-                for i in 0..10 {
+                for i in 0..num_workers {
                     workers.insert(
                         i,
                         Worker::new(i as u32, job_receiver.clone(), event_tx.clone()),

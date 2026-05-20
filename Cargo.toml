@@ -2,6 +2,7 @@
 name = "ferrumphp"
 version = "0.1.0"
 edition = "2024"
+description = "A PHP Application Server"
 
 [dependencies]
 ext-php-rs = { version = "0.15.12", features = ["embed"] }
@@ -16,6 +17,8 @@ tokio-stream = "0.1.18"
 http-body-util = "0.1.3"
 futures-util = "0.3.32"
 thiserror = "2.0.18"
+clap = { version = "4.6.0", features = ["derive", "env"] }
+anyhow = "1.0.102"
 [build-dependencies]
 ext-php-rs-bindgen = "0.72.1-extphprs.1"
 cc = "1.2.62"

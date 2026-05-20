@@ -4,20 +4,24 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
-use std::net::SocketAddr;
 use std::time::Duration;
+use clap::Parser;
 use tokio::net::TcpListener;
+use crate::cli::Cli;
 
 mod php;
+mod cli;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let config = cli.validate()?;
+
     let (async_request_sender, async_request_receiver) = tokio::sync::mpsc::channel::<Job>(20);
 
-    let pool = WorkerPool::new(async_request_receiver);
+    let pool = WorkerPool::new(config.workers, async_request_receiver);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(config.bind).await?;
     let builder = auto::Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
 
