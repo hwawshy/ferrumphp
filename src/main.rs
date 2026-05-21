@@ -19,11 +19,11 @@ async fn main() -> anyhow::Result<()> {
 
     let (async_request_sender, async_request_receiver) = tokio::sync::mpsc::channel::<Job>(20);
 
-    let pool = WorkerPool::new(config.workers, async_request_receiver);
-
     let listener = TcpListener::bind(config.bind).await?;
     let builder = auto::Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
+
+    let pool = WorkerPool::new(config, async_request_receiver);
 
     loop {
         tokio::select! {

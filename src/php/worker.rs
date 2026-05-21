@@ -9,7 +9,7 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(
-        id: u32,
+        id: usize,
         rx: Receiver<Job>,
         event_tx: std::sync::mpsc::SyncSender<WorkerEvent>,
     ) -> Self {
@@ -23,13 +23,13 @@ impl Worker {
                     job.response_head_tx,
                     job.response_body_tx,
                 ) {
-                    let _ = event_tx.send(WorkerEvent::ErrorExit(id as usize));
+                    let _ = event_tx.send(WorkerEvent::ErrorExit(id));
                     return;
                 }
             }
 
             println!("Worker {} shutting down", id);
-            let _ = event_tx.send(WorkerEvent::Exit(id as usize));
+            let _ = event_tx.send(WorkerEvent::Exit(id));
         });
 
         Self { handle }

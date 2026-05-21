@@ -101,7 +101,7 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
     if str.is_null() || str_length == 0 {
         return 0;
     }
-    let Some(ctx) = ServerContext::get_mut() else {
+    let Some(ctx) = ServerContext::get_request_context_mut() else {
         return 0;
     };
 
@@ -114,9 +114,7 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
     // );
 
     // This will buffer if headers are not sent yet. Maybe some memory check here?
-    let sender = ctx.response_tx.as_ref().expect("ub_write found no sender");
-
-    if let Err(_) = sender.blocking_send(Bytes::from(buf)) {
+    if let Err(_) = ctx.response_tx.blocking_send(Bytes::from(buf)) {
         println!("aborted connection");
         unsafe {
             php_handle_aborted_connection();
@@ -156,7 +154,7 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
         return SapiHeaderSendResult::SentSuccessfully.into();
     }
 
-    let Some(ctx) = ServerContext::get_mut() else {
+    let Some(ctx) = ServerContext::get_request_context_mut() else {
         // @todo when can this happen? panic here?
         return SapiHeaderSendResult::SendFailed.into();
     };
@@ -220,7 +218,7 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
         return 0;
     }
 
-    let Some(ctx) = ServerContext::get_mut() else {
+    let Some(ctx) = ServerContext::get_request_context_mut() else {
         // @todo when can this happen? panic here?
         return 0;
     };
@@ -261,7 +259,7 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
 }
 
 extern "C" fn read_cookies() -> *mut c_char {
-    let Some(ctx) = ServerContext::get_mut() else {
+    let Some(ctx) = ServerContext::get_request_context_mut() else {
         return std::ptr::null_mut();
     };
 
