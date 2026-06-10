@@ -1,21 +1,24 @@
+use crate::CONFIG;
 use crate::php::context::ServerContext;
 use crate::php::ffi::{ferrumphp_error, php_handle_aborted_connection, sapi_send_headers};
+use crate::php::interned::{INTERNED, Interned};
 use bytes::{Buf, Bytes};
-use ext_php_rs::builders::SapiBuilder;
-use ext_php_rs::embed::{
-    SapiModule, ServerVarRegistrar, ext_php_rs_sapi_shutdown, ext_php_rs_sapi_startup,
-};
+use ext_php_rs::boxed::ZBox;
+use ext_php_rs::builders::{ModuleBuilder, SapiBuilder};
+use ext_php_rs::embed::{SapiModule, ext_php_rs_sapi_shutdown, ext_php_rs_sapi_startup};
 use ext_php_rs::ffi::{
     ZEND_RESULT_CODE_FAILURE, ZEND_RESULT_CODE_SUCCESS, php_module_shutdown, php_module_startup,
     sapi_headers_struct, sapi_shutdown, sapi_startup,
 };
-use ext_php_rs::types::Zval;
-use ext_php_rs::zend::SapiGlobals;
-use hyper::header::{HeaderName, HeaderValue};
+use ext_php_rs::types::{ZendStr, Zval};
+use ext_php_rs::zend::{SapiGlobals, StaticModuleEntry};
+use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue};
 use hyper::{HeaderMap, Response, StatusCode};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::Read;
 use std::str::FromStr;
+
+static MODULE: StaticModuleEntry = StaticModuleEntry::new();
 
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -55,12 +58,20 @@ impl Sapi {
 
         let sapi_ptr = module.into_raw();
 
+        let entry_ptr = MODULE.get_or_init(|| {
+            let (entry, _) = ModuleBuilder::new("ferrumphp", "0.1")
+                .startup_function(module_startup)
+                .try_into()
+                .unwrap();
+            entry
+        });
+
         unsafe {
             ext_php_rs_sapi_startup();
 
             sapi_startup(sapi_ptr);
 
-            php_module_startup(sapi_ptr, std::ptr::null_mut());
+            php_module_startup(sapi_ptr, entry_ptr);
         }
 
         Self(sapi_ptr)
@@ -95,6 +106,13 @@ impl Drop for Sapi {
     }
 }
 
+unsafe extern "C" fn module_startup(_type: i32, _module_number: i32) -> i32 {
+    let config = CONFIG.get().expect("Config not initialized");
+
+    INTERNED.get_or_init(|| unsafe { Interned::init(config) });
+
+    ZEND_RESULT_CODE_SUCCESS
+}
 extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
     println!("ub_write");
 
@@ -270,28 +288,16 @@ extern "C" fn read_cookies() -> *mut c_char {
 }
 
 extern "C" fn register_server_variables(vars: *mut Zval) {
-    if vars.is_null() {
+    // SAFETY: PHP ensures pointer is de-referencable
+    let Some(vars) = (unsafe { vars.as_mut() }).and_then(|x| x.array_mut()) else {
         return;
-    }
+    };
 
-    let globals = SapiGlobals::get_mut();
-    let request_info = globals.request_info();
+    let Some(ctx) = ServerContext::get_request_context_mut() else {
+        return;
+    };
 
-    let mut registrar = unsafe { ServerVarRegistrar::from_raw(vars) };
-
-    registrar.register("SERVER_SOFTWARE", "ferrumphp/0.1");
-
-    if let Some(request_uri) = request_info.request_uri() {
-        registrar.register("REQUEST_URI", request_uri);
-    }
-
-    if let Some(request_method) = request_info.request_method() {
-        registrar.register("REQUEST_METHOD", request_method);
-    }
-
-    if let Some(query_string) = request_info.query_string() {
-        registrar.register("QUERY_STRING", query_string);
-    }
+    unsafe { ctx.register_server_variables(vars) };
 }
 
 extern "C" fn deactivate() -> c_int {

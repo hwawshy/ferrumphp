@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     cc::Build::new()
-        .compiler("clang")
+        .compiler("clang-18")
         .define("ZTS", "1")
         .file("build/ferrumphp.c")
         .includes(include_paths)

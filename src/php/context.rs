@@ -1,19 +1,24 @@
+use crate::CONFIG;
+use crate::cli::Config;
+use crate::php::interned::{INTERNED, Interned};
 use bytes::Bytes;
+use ext_php_rs::boxed::ZBox;
 use ext_php_rs::embed::{ext_php_rs_sapi_per_thread_init, ext_php_rs_sapi_per_thread_shutdown};
 use ext_php_rs::ffi::{
     ZEND_RESULT_CODE_SUCCESS, ext_php_rs_sapi_globals, php_execute_script, php_request_shutdown,
     php_request_startup, zend_destroy_file_handle, zend_file_handle, zend_stream_init_filename,
 };
+use ext_php_rs::types::{ZendHashTable, ZendStr, Zval};
 use ext_php_rs::zend::{SapiGlobals, try_catch, try_catch_first};
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use hyper::http::Extensions;
 use hyper::http::request::Parts as RequestParts;
 use hyper::http::response::Parts as ResponseParts;
-use hyper::{StatusCode, Version};
-use std::ffi::{CString, NulError, c_int};
+use hyper::{HeaderMap, StatusCode, Version};
+use std::ffi::{CStr, CString, NulError, c_int};
 use std::mem::MaybeUninit;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot::Sender as OneshotSender;
 
@@ -43,18 +48,8 @@ impl ServerContext {
         head_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
     ) -> Result<(), ()> {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("src/php/test.php");
-
-        let filename = path.to_str().unwrap();
-
-        let request_ctx = PhpRequestContext::new(
-            request_head,
-            filename,
-            request_body_rx,
-            head_tx,
-            response_tx
-        ).unwrap();
+        let request_ctx =
+            PhpRequestContext::new(request_head, request_body_rx, head_tx, response_tx).unwrap();
 
         self.request_ctx = Some(request_ctx);
 
@@ -80,8 +75,6 @@ impl ServerContext {
 
 struct WorkerConfig {
     worker_id: usize,
-    //bind: SocketAddr,
-    //filename: PathBuf
 }
 
 pub struct WorkerContext {
@@ -98,7 +91,7 @@ impl WorkerContext {
             panic!("server context already set");
         }
 
-        let mut server_ctx = Box::new(ServerContext::new(WorkerConfig {worker_id}));
+        let mut server_ctx = Box::new(ServerContext::new(WorkerConfig { worker_id }));
 
         sg.server_context = server_ctx.as_mut() as *mut _ as *mut _;
 
@@ -112,7 +105,8 @@ impl WorkerContext {
         head_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
     ) -> Result<(), ()> {
-        self.server_ctx.handle_request(request_head, request_body_rx, head_tx, response_tx)
+        self.server_ctx
+            .handle_request(request_head, request_body_rx, head_tx, response_tx)
     }
 }
 
@@ -139,18 +133,20 @@ pub struct PhpRequestContext {
     pub current_request_body_chunk: Option<Bytes>,
     pub head_tx: Option<OneshotSender<ResponseParts>>,
     pub response_tx: Sender<Bytes>,
-    //php_headers: Vec<(CString, Vec<u8>)>
+    pub headers: HeaderMap,
+    extensions: Extensions,
 }
 
 impl PhpRequestContext {
     // @TODO validation and suitable error type
     pub fn new(
         head: RequestParts,
-        filename: &str,
         request_body_rx: Option<Receiver<Bytes>>,
         head_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
     ) -> Result<Self, NulError> {
+        let filename = CONFIG.get().unwrap().entrypoint.to_str().unwrap();
+
         let filename = CString::new(filename)?;
 
         let method = CString::new(head.method.as_str())?;
@@ -178,21 +174,6 @@ impl PhpRequestContext {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| CString::new(s).ok());
 
-        // let mut php_headers: Vec<(CString, Vec<u8>)> = vec![];
-        //
-        // // @todo improve performance, look into php interned strings for header keys
-        // for (name, value) in &headers {
-        //     let mut key = String::from("HTTP_");
-        //
-        //     key.push_str(
-        //         &name.as_str()
-        //             .to_ascii_uppercase()
-        //             .replace('-', "_")
-        //     );
-        //
-        //     php_headers.push((CString::new(key).unwrap(), value.as_bytes().to_vec()));
-        // }
-
         let proto_num = match head.version {
             Version::HTTP_09 => 900,
             Version::HTTP_10 => 1000,
@@ -215,6 +196,8 @@ impl PhpRequestContext {
             current_request_body_chunk: None,
             head_tx: Some(head_tx),
             response_tx,
+            headers,
+            extensions: head.extensions,
         })
     }
 
@@ -293,6 +276,205 @@ impl PhpRequestContext {
             .map(|c| c.as_ptr())
             .unwrap_or_default();
         sapi_globals.request_info.proto_num = self.proto_num;
+    }
+
+    pub unsafe fn register_server_variables(&self, vars: &mut ZendHashTable) {
+        let config = CONFIG.get().expect("Config not initialized");
+        let interned = INTERNED.get().expect("Interned strings not initialized");
+
+        // hard-coded values
+        let _ = vars.insert(
+            &interned.server_software,
+            self.zval_from_interned(&interned.ferrumphp),
+        );
+        let _ = vars.insert(
+            &interned.gateway_interface,
+            self.zval_from_interned(&interned.cgi11),
+        );
+        let _ = vars.insert(
+            &interned.server_addr,
+            self.zval_from_interned(&interned.server_addr_value),
+        );
+        let _ = vars.insert(
+            &interned.server_port,
+            self.zval_from_interned(&interned.server_port_value),
+        );
+        let _ = vars.insert(
+            &interned.script_filename,
+            self.zval_from_interned(&interned.script_filename_value),
+        );
+        let _ = vars.insert(
+            &interned.document_root,
+            self.zval_from_interned(&interned.document_root_value),
+        );
+        let _ = vars.insert(
+            &interned.script_name,
+            self.zval_from_interned(&interned.script_name_value),
+        );
+
+        self.register_path_variables(vars, interned);
+        self.register_remote_variables(vars, interned, config);
+
+        let _ = vars.insert(&interned.request_uri, self.zval_from_cstr(&self.uri));
+        let _ = vars.insert(&interned.request_method, self.zval_from_cstr(&self.method));
+
+        if let Some(ref query) = self.query {
+            let _ = vars.insert(&interned.query_string, self.zval_from_cstr(query));
+        }
+
+        if let Some(ref content_type) = self.content_type {
+            let _ = vars.insert(&interned.content_type, self.zval_from_cstr(content_type));
+        }
+
+        if let Some(content_length) = self.content_length {
+            let mut zval = Zval::new();
+            zval.set_long(content_length);
+
+            let _ = vars.insert(&interned.content_length, zval);
+        }
+
+        // SERVER_NAME — from Host header
+        if let Some(host) = self
+            .headers
+            .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|host| host.split(':').next())
+        {
+            let _ = vars.insert(&interned.server_name, self.zval_from_str(host));
+        }
+
+        // SERVER_PROTOCOL — from request version
+        let protocol = match self.proto_num {
+            900 => "HTTP/0.9",
+            1000 => "HTTP/1.0",
+            1100 => "HTTP/1.1",
+            2000 => "HTTP/2",
+            3000 => "HTTP/3",
+            _ => "HTTP/1.1",
+        };
+
+        let _ = vars.insert(&interned.server_protocol, self.zval_from_str(protocol));
+
+        for (header_name, header_value) in self.headers.iter() {
+            if header_name == CONTENT_TYPE || header_name == CONTENT_LENGTH {
+                continue;
+            }
+
+            if header_name.as_str().contains('_') {
+                continue;
+            }
+
+            let mut zval = Zval::new();
+            zval.set_binary(header_value.as_ref().to_vec());
+
+            match interned.map_header_name(header_name) {
+                Some(interned_name) => {
+                    let _ = vars.insert(interned_name, zval);
+                }
+                None => {
+                    let mut key = String::from("HTTP_");
+
+                    key.push_str(&header_name.as_str().to_ascii_uppercase().replace('-', "_"));
+
+                    let _ = vars.insert(key, zval);
+                }
+            };
+        }
+    }
+
+    /// PATH_INFO, PHP_SELF
+    fn register_path_variables(&self, vars: &mut ZendHashTable, interned: &Interned) {
+        let entrypoint = &CONFIG.get().unwrap().entrypoint;
+        let document_root = entrypoint.parent().unwrap().to_str().unwrap();
+        let script_name = entrypoint
+            .to_str()
+            .unwrap()
+            .strip_prefix(document_root)
+            .unwrap();
+
+        let uri = self.uri.to_str().unwrap();
+
+        let path_info = if let Some(rest) = uri.strip_prefix(script_name) {
+            match rest {
+                "" => None,
+                _ => Some(rest),
+            }
+        } else {
+            match uri {
+                "" => None,
+                _ => Some(uri),
+            }
+        };
+
+        if let Some(path_info) = path_info {
+            let _ = vars.insert(&interned.path_info, self.zval_from_str(path_info));
+
+            let mut php_self = String::with_capacity(script_name.len() + path_info.len());
+
+            php_self.push_str(script_name);
+            php_self.push_str(path_info);
+
+            let _ = vars.insert(&interned.php_self, self.zval_from_str(&php_self));
+        }
+    }
+
+    fn register_remote_variables(
+        &self,
+        vars: &mut ZendHashTable,
+        interned: &Interned,
+        config: &Config,
+    ) {
+        let Some(remote) = self.extensions.get::<SocketAddr>() else {
+            return;
+        };
+
+        if config.is_trusted_proxy(remote.ip())
+            && let Some(ip) = self.forwarded_client_ip()
+        {
+            let _ = vars.insert(&interned.remote_addr, self.zval_from_str(&ip.to_string()));
+        } else {
+            let _ = vars.insert(
+                &interned.remote_addr,
+                self.zval_from_str(&remote.ip().to_string()),
+            );
+        }
+
+        let mut zval = Zval::new();
+        let _ = zval.set_long(remote.port());
+
+        let _ = vars.insert(&interned.remote_port, zval);
+    }
+
+    pub fn forwarded_client_ip(&self) -> Option<IpAddr> {
+        let value = self.headers.get("x-forwarded-for")?;
+        let value = value.to_str().ok()?;
+
+        let first = value.split(',').next()?.trim();
+
+        first.parse().ok()
+    }
+
+    fn zval_from_str(&self, value: &str) -> Zval {
+        let mut zval = Zval::new();
+        let _ = zval.set_string(value, false);
+
+        zval
+    }
+
+    fn zval_from_interned(&self, interned: &ZendStr) -> Zval {
+        let mut zval = Zval::new();
+        zval.set_zend_string(unsafe { ZBox::from_raw(interned.as_ptr().cast_mut()) });
+
+        zval
+    }
+
+    fn zval_from_cstr(&self, cstr: &CStr) -> Zval {
+        let zend_str = ZendStr::from_c_str(cstr, false);
+
+        let mut zval = Zval::new();
+        zval.set_zend_string(zend_str);
+
+        zval
     }
 }
 

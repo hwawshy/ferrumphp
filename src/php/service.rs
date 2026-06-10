@@ -6,6 +6,7 @@ use hyper::Error as HyperError;
 use hyper::body::{Body, Frame, Incoming};
 use hyper::http::response::Parts;
 use hyper::{Request, Response};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use thiserror::Error;
@@ -19,12 +20,14 @@ use tower::Service;
 #[derive(Clone)]
 pub struct PhpService {
     sender: PollSender<Job>,
+    peer_addr: SocketAddr,
 }
 
 impl PhpService {
-    pub fn new(sender: Sender<Job>) -> Self {
+    pub fn new(sender: Sender<Job>, peer_addr: SocketAddr) -> Self {
         Self {
             sender: PollSender::new(sender),
+            peer_addr,
         }
     }
 }
@@ -55,7 +58,9 @@ impl Service<Request<Incoming>> for PhpService {
             .map_err(|_| PhpError::JobChannelClosed)
     }
 
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, mut req: Request<Incoming>) -> Self::Future {
+        req.extensions_mut().insert(self.peer_addr);
+
         let (parts, body) = req.into_parts();
 
         let (response_body_tx, response_body_rx) = channel::<Bytes>(10); // @todo rethink this buffer

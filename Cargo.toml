@@ -5,7 +5,7 @@ edition = "2024"
 description = "A PHP Application Server"
 
 [dependencies]
-ext-php-rs = { version = "0.15.12", features = ["embed"] }
+ext-php-rs = { version = "0.15.15", features = ["embed"] }
 crossbeam-channel = "0.5.15"
 hyper = { version = "1", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
@@ -19,6 +19,7 @@ futures-util = "0.3.32"
 thiserror = "2.0.18"
 clap = { version = "4.6.0", features = ["derive", "env"] }
 anyhow = "1.0.102"
+ipnet = "2.12.0"
 [build-dependencies]
 ext-php-rs-bindgen = "0.72.1-extphprs.1"
 cc = "1.2.62"

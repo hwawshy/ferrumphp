@@ -1,6 +1,7 @@
-use std::net::SocketAddr;
+use anyhow::{Context, bail};
+use ipnet::IpNet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use anyhow::{bail, Context};
 
 #[derive(clap::Parser, Debug)]
 #[command(
@@ -21,6 +22,15 @@ pub struct Cli {
     /// Number of PHP workers
     #[arg(long, default_value_t = 10)]
     pub workers: usize,
+
+    /// Trusted proxy CIDRs
+    ///
+    /// Examples:
+    /// --trusted-proxy 127.0.0.1/32
+    /// --trusted-proxy 10.0.0.0/8
+    /// --trusted-proxy ::1/128
+    #[arg(long = "trusted-proxy")]
+    pub trusted_proxies: Vec<IpNet>,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +38,15 @@ pub struct Config {
     pub bind: SocketAddr,
     pub entrypoint: PathBuf,
     pub workers: usize,
+    pub trusted_proxies: Vec<IpNet>,
+}
+
+impl Config {
+    pub fn is_trusted_proxy(&self, peer_ip: IpAddr) -> bool {
+        self.trusted_proxies
+            .iter()
+            .any(|net| net.contains(&peer_ip))
+    }
 }
 
 impl Cli {
@@ -39,18 +58,12 @@ impl Cli {
 
         // entrypoint existence
         if !self.entrypoint.exists() {
-            bail!(
-                "entrypoint does not exist: {}",
-                self.entrypoint.display()
-            );
+            bail!("entrypoint does not exist: {}", self.entrypoint.display());
         }
 
         // entrypoint must be a file
         if !self.entrypoint.is_file() {
-            bail!(
-                "entrypoint is not a file: {}",
-                self.entrypoint.display()
-            );
+            bail!("entrypoint is not a file: {}", self.entrypoint.display());
         }
 
         // canonicalize path
@@ -61,16 +74,14 @@ impl Cli {
 
         // optional sanity check
         if entrypoint.extension().and_then(|e| e.to_str()) != Some("php") {
-            bail!(
-                "entrypoint must be a PHP file: {}",
-                entrypoint.display()
-            );
+            bail!("entrypoint must be a PHP file: {}", entrypoint.display());
         }
 
         Ok(Config {
             bind: self.bind,
             entrypoint,
             workers: self.workers,
+            trusted_proxies: self.trusted_proxies,
         })
     }
 }
