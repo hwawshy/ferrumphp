@@ -10,7 +10,7 @@ use ext_php_rs::ffi::{
 };
 use ext_php_rs::types::{ZendHashTable, ZendStr, Zval};
 use ext_php_rs::zend::{SapiGlobals, try_catch, try_catch_first};
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use hyper::http::Extensions;
 use hyper::http::request::Parts as RequestParts;
 use hyper::http::response::Parts as ResponseParts;
@@ -21,6 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot::Sender as OneshotSender;
+use crate::php::ffi::php_handle_auth_data;
 
 pub struct ServerContext {
     pub request_ctx: Option<PhpRequestContext>,
@@ -276,6 +277,16 @@ impl PhpRequestContext {
             .map(|c| c.as_ptr())
             .unwrap_or_default();
         sapi_globals.request_info.proto_num = self.proto_num;
+
+        // PHP expects the value of auth header to be a C string and copies anything it wants,
+        // so we are free to drop the C string after the php_handle_auth_data function call.
+        if let Some(auth) = self.headers.get(AUTHORIZATION) {
+            if let Ok(auth) = CString::new(auth.as_bytes()) {
+                unsafe {
+                    php_handle_auth_data(auth.as_ptr());
+                }
+            }
+        }
     }
 
     pub unsafe fn register_server_variables(&self, vars: &mut ZendHashTable) {

@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clang_arg("-DZTS=1")
         .allowlist_function("sapi_send_headers")
         .allowlist_function("php_handle_aborted_connection")
+        .allowlist_function("php_handle_auth_data")
         .allowlist_function("ferrumphp_error");
 
     let bindings = builder.generate()?;
