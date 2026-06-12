@@ -1,6 +1,7 @@
 use crate::php::Job;
 use bytes::Bytes;
-use futures_util::stream::{Map, StreamExt};
+use futures_util::Stream;
+use futures_util::stream::StreamExt;
 use http_body_util::StreamBody;
 use hyper::Error as HyperError;
 use hyper::body::{Body, Frame, Incoming};
@@ -75,14 +76,14 @@ impl Service<Request<Incoming>> for PhpService {
                 response_body_tx,
             };
 
-            let fut = PhpFuture::WaitingResponse {
+            let fut = PhpFuture::WithoutRequestBody {
                 response_body_rx,
                 response_head_rx,
             };
 
             (job, fut)
         } else {
-            // This buffer plays a role in ensuring fairness cap per poll in PhpFuture
+            // This buffer plays a role in ensuring fairness cap per poll in RequestBodyFuture
             let (request_body_tx, request_body_rx) = channel::<Bytes>(8); // @todo rethink this buffer
 
             let job = Job {
@@ -92,10 +93,14 @@ impl Service<Request<Incoming>> for PhpService {
                 response_body_tx,
             };
 
-            let fut = PhpFuture::StreamingRequest {
+            let request_body_future = RequestBodyFuture {
                 request_body: body,
                 request_body_tx: PollSender::new(request_body_tx),
                 current_request_body_chunk: None,
+            };
+
+            let fut = PhpFuture::WithRequestBody {
+                request_body_future,
                 response_body_rx,
                 response_head_rx,
             };
@@ -111,17 +116,54 @@ impl Service<Request<Incoming>> for PhpService {
     }
 }
 
-type PhpStream = Map<ReceiverStream<Bytes>, fn(Bytes) -> Result<Frame<Bytes>, PhpError>>;
+pub struct RequestBodyFuture {
+    request_body: Incoming,
+    request_body_tx: PollSender<Bytes>,
+    current_request_body_chunk: Option<Bytes>,
+}
+
+impl Future for RequestBodyFuture {
+    type Output = Option<Result<(), PhpError>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            match self.current_request_body_chunk {
+                None => {
+                    let frame = ready!(Pin::new(&mut self.request_body).poll_frame(cx));
+
+                    if let Some(frame) = frame {
+                        // ignore trailers
+                        if let Ok(data) = frame?.into_data() {
+                            self.current_request_body_chunk = Some(data);
+                        }
+                    } else {
+                        // end of stream
+                        self.request_body_tx.close();
+                        return Poll::Ready(None);
+                    }
+                }
+                Some(_) => {
+                    // stream body chunk
+                    ready!(Pin::new(&mut self.request_body_tx).poll_reserve(cx))
+                        .map_err(|_| PhpError::RequestBodyClosed)?;
+
+                    let chunk = self.current_request_body_chunk.take().unwrap();
+                    self.request_body_tx
+                        .send_item(chunk)
+                        .map_err(|_| PhpError::RequestBodyClosed)?
+                }
+            }
+        }
+    }
+}
 
 pub enum PhpFuture {
-    StreamingRequest {
-        request_body: Incoming,
-        request_body_tx: PollSender<Bytes>,
-        current_request_body_chunk: Option<Bytes>,
+    WithRequestBody {
+        request_body_future: RequestBodyFuture,
         response_head_rx: oneshot::Receiver<Parts>,
         response_body_rx: Receiver<Bytes>,
     },
-    WaitingResponse {
+    WithoutRequestBody {
         response_head_rx: oneshot::Receiver<Parts>,
         response_body_rx: Receiver<Bytes>,
     },
@@ -130,14 +172,14 @@ pub enum PhpFuture {
 }
 
 impl PhpFuture {
-    fn transition_to_waiting_response(&mut self) {
+    fn transition_to_without_request_body(&mut self) {
         match std::mem::replace(self, PhpFuture::Done) {
-            PhpFuture::StreamingRequest {
+            PhpFuture::WithRequestBody {
                 response_head_rx,
                 response_body_rx,
                 ..
             } => {
-                *self = PhpFuture::WaitingResponse {
+                *self = PhpFuture::WithoutRequestBody {
                     response_head_rx,
                     response_body_rx,
                 }
@@ -146,13 +188,8 @@ impl PhpFuture {
         }
     }
 
-    fn transition_to_done(&mut self) -> Receiver<Bytes> {
-        match std::mem::replace(self, PhpFuture::Done) {
-            PhpFuture::WaitingResponse {
-                response_body_rx, ..
-            } => response_body_rx,
-            _ => unreachable!(),
-        }
+    fn transition_to_done(&mut self) -> Self {
+        std::mem::replace(self, PhpFuture::Done)
     }
 }
 
@@ -161,58 +198,169 @@ impl Future for PhpFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        loop {
-            match this {
-                PhpFuture::Done => panic!("PhpFuture polled after completion"),
-                PhpFuture::Err(_) => match std::mem::replace(this, PhpFuture::Done) {
-                    PhpFuture::Err(e) => return Poll::Ready(Err(e)),
-                    _ => unreachable!(),
-                },
-                PhpFuture::StreamingRequest {
-                    request_body,
-                    request_body_tx,
-                    current_request_body_chunk,
-                    ..
-                } => {
-                    match current_request_body_chunk {
-                        None => {
-                            let frame = ready!(Pin::new(request_body).poll_frame(cx));
+        match this {
+            PhpFuture::Done => panic!("PhpFuture polled after completion"),
+            PhpFuture::Err(_) => match this.transition_to_done() {
+                PhpFuture::Err(e) => Poll::Ready(Err(e)),
+                _ => unreachable!(),
+            },
+            PhpFuture::WithoutRequestBody {
+                response_head_rx, ..
+            } => {
+                let parts = ready!(Pin::new(response_head_rx).poll(cx))
+                    .map_err(|e| PhpError::ResponseHeadClosed(e))?;
 
-                            if let Some(frame) = frame {
-                                // ignore trailers
-                                if let Ok(data) = frame?.into_data() {
-                                    *current_request_body_chunk = Some(data);
-                                }
-                            } else {
-                                // end of stream
-                                request_body_tx.close();
-                                this.transition_to_waiting_response();
-                            }
-                        }
-                        Some(_) => {
-                            // stream body chunk
-                            ready!(Pin::new(&mut *request_body_tx).poll_reserve(cx))
-                                .map_err(|_| PhpError::RequestBodyClosed)?;
+                match this.transition_to_done() {
+                    PhpFuture::WithoutRequestBody {
+                        response_body_rx, ..
+                    } => {
+                        let stream = PhpStream::WithoutRequestBody {
+                            response_body_stream: ReceiverStream::new(response_body_rx),
+                        };
 
-                            request_body_tx
-                                .send_item(current_request_body_chunk.take().unwrap())
-                                .map_err(|_| PhpError::RequestBodyClosed)?
-                        }
+                        Poll::Ready(Ok(Response::from_parts(parts, StreamBody::new(stream))))
                     }
-                }
-                PhpFuture::WaitingResponse {
-                    response_head_rx, ..
-                } => {
-                    let parts = ready!(Pin::new(response_head_rx).poll(cx))
-                        .map_err(|e| PhpError::ResponseHeadClosed(e))?;
-                    let response_body_rx = this.transition_to_done();
-
-                    let stream: PhpStream =
-                        ReceiverStream::new(response_body_rx).map(|chunk| Ok(Frame::data(chunk)));
-
-                    return Poll::Ready(Ok(Response::from_parts(parts, StreamBody::new(stream))));
+                    _ => unreachable!(),
                 }
             }
+            PhpFuture::WithRequestBody {
+                response_head_rx,
+                request_body_future,
+                ..
+            } => {
+                // First see if PHP headers are ready
+                if let Poll::Ready(parts) = Pin::new(response_head_rx).poll(cx)? {
+                    match this.transition_to_done() {
+                        PhpFuture::WithRequestBody {
+                            request_body_future,
+                            response_body_rx,
+                            ..
+                        } => {
+                            let stream = PhpStream::WithRequestBody {
+                                request_body_future,
+                                response_body_stream: ReceiverStream::new(response_body_rx),
+                            };
+
+                            return Poll::Ready(Ok(Response::from_parts(
+                                parts,
+                                StreamBody::new(stream),
+                            )));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                // Headers not ready, try streaming request to PHP
+                match Pin::new(request_body_future).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => {
+                        this.transition_to_without_request_body();
+                        Poll::Pending
+                    }
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+                    // RequestBodyFuture does not return an Ok variant
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+pub enum PhpStream {
+    WithRequestBody {
+        request_body_future: RequestBodyFuture,
+        response_body_stream: ReceiverStream<Bytes>,
+    },
+    WithoutRequestBody {
+        response_body_stream: ReceiverStream<Bytes>,
+    },
+    Done,
+}
+
+impl PhpStream {
+    fn transition_to_without_request_body(&mut self) {
+        match std::mem::replace(self, PhpStream::Done) {
+            PhpStream::WithRequestBody {
+                response_body_stream,
+                ..
+            } => {
+                *self = PhpStream::WithoutRequestBody {
+                    response_body_stream,
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn transition_to_done(&mut self) {
+        let _ = std::mem::replace(self, PhpStream::Done);
+    }
+}
+
+impl Stream for PhpStream {
+    type Item = Result<Frame<Bytes>, PhpError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        match this {
+            PhpStream::Done => panic!("PhpStream polled after completion"),
+            PhpStream::WithRequestBody {
+                request_body_future,
+                response_body_stream,
+            } => {
+                // First try to stream a response chunk
+                if let Poll::Ready(r) =
+                    Pin::new(&mut response_body_stream.map(|chunk| Ok(Frame::data(chunk))))
+                        .poll_next(cx)
+                {
+                    if r.is_none() {
+                        // PHP closed the response channel
+                        this.transition_to_done();
+                    }
+
+                    return Poll::Ready(r);
+                }
+
+                // No response chunk ready, try streaming request to PHP
+                match Pin::new(request_body_future).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => {
+                        this.transition_to_without_request_body();
+                        Poll::Pending
+                    }
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                    // RequestBodyFuture does not return an Ok variant
+                    _ => unreachable!(),
+                }
+            }
+            PhpStream::WithoutRequestBody {
+                response_body_stream,
+            } => {
+                let result =
+                    Pin::new(&mut response_body_stream.map(|chunk| Ok(Frame::data(chunk))))
+                        .poll_next(cx);
+
+                if let Poll::Ready(None) = result {
+                    // PHP closed the response channel
+                    this.transition_to_done();
+                }
+
+                result
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            PhpStream::WithRequestBody {
+                response_body_stream,
+                ..
+            } => response_body_stream.size_hint(),
+            PhpStream::WithoutRequestBody {
+                response_body_stream,
+            } => response_body_stream.size_hint(),
+            PhpStream::Done => (0, None),
         }
     }
 }
