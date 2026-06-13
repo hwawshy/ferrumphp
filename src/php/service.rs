@@ -1,7 +1,6 @@
 use crate::php::Job;
 use bytes::Bytes;
 use futures_util::Stream;
-use futures_util::stream::StreamExt;
 use http_body_util::StreamBody;
 use hyper::Error as HyperError;
 use hyper::body::{Body, Frame, Incoming};
@@ -123,7 +122,7 @@ pub struct RequestBodyFuture {
 }
 
 impl Future for RequestBodyFuture {
-    type Output = Option<Result<(), PhpError>>;
+    type Output = Result<(), PhpError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
@@ -139,7 +138,7 @@ impl Future for RequestBodyFuture {
                     } else {
                         // end of stream
                         self.request_body_tx.close();
-                        return Poll::Ready(None);
+                        return Poll::Ready(Ok(()));
                     }
                 }
                 Some(_) => {
@@ -253,13 +252,11 @@ impl Future for PhpFuture {
                 // Headers not ready, try streaming request to PHP
                 match Pin::new(request_body_future).poll(cx) {
                     Poll::Pending => Poll::Pending,
-                    Poll::Ready(None) => {
+                    Poll::Ready(Ok(_)) => {
                         this.transition_to_without_request_body();
                         Poll::Pending
                     }
-                    Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
-                    // RequestBodyFuture does not return an Ok variant
-                    _ => unreachable!(),
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                 }
             }
         }
@@ -310,10 +307,11 @@ impl Stream for PhpStream {
                 response_body_stream,
             } => {
                 // First try to stream a response chunk
-                if let Poll::Ready(r) =
-                    Pin::new(&mut response_body_stream.map(|chunk| Ok(Frame::data(chunk))))
-                        .poll_next(cx)
-                {
+                let result = Pin::new(response_body_stream)
+                    .poll_next(cx)
+                    .map(|chunk| chunk.map(|c| Ok(Frame::data(c))));
+
+                if let Poll::Ready(r) = result {
                     if r.is_none() {
                         // PHP closed the response channel
                         this.transition_to_done();
@@ -325,21 +323,19 @@ impl Stream for PhpStream {
                 // No response chunk ready, try streaming request to PHP
                 match Pin::new(request_body_future).poll(cx) {
                     Poll::Pending => Poll::Pending,
-                    Poll::Ready(None) => {
+                    Poll::Ready(Ok(_)) => {
                         this.transition_to_without_request_body();
                         Poll::Pending
                     }
-                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-                    // RequestBodyFuture does not return an Ok variant
-                    _ => unreachable!(),
+                    Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
                 }
             }
             PhpStream::WithoutRequestBody {
                 response_body_stream,
             } => {
-                let result =
-                    Pin::new(&mut response_body_stream.map(|chunk| Ok(Frame::data(chunk))))
-                        .poll_next(cx);
+                let result = Pin::new(response_body_stream)
+                    .poll_next(cx)
+                    .map(|chunk| chunk.map(|c| Ok(Frame::data(c))));
 
                 if let Poll::Ready(None) = result {
                     // PHP closed the response channel
