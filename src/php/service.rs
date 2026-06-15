@@ -66,9 +66,12 @@ impl Service<Request<Incoming>> for PhpService {
         let (response_body_tx, response_body_rx) = channel::<Bytes>(10); // @todo rethink this buffer
         let (response_head_tx, response_head_rx) = oneshot::channel::<Parts>();
 
+        let span = tracing::Span::current();
+
         // Do we have a request body?
         let (job, fut) = if body.is_end_stream() {
             let job = Job {
+                span,
                 request_head: parts,
                 request_body_rx: None,
                 response_head_tx,
@@ -86,6 +89,7 @@ impl Service<Request<Incoming>> for PhpService {
             let (request_body_tx, request_body_rx) = channel::<Bytes>(8); // @todo rethink this buffer
 
             let job = Job {
+                span,
                 request_head: parts,
                 request_body_rx: Some(request_body_rx),
                 response_head_tx,

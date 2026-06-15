@@ -1,5 +1,6 @@
 use crate::CONFIG;
 use crate::cli::Config;
+use crate::php::ffi::php_handle_auth_data;
 use crate::php::interned::{INTERNED, Interned};
 use bytes::Bytes;
 use ext_php_rs::boxed::ZBox;
@@ -19,9 +20,9 @@ use std::ffi::{CStr, CString, NulError, c_int};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
+use std::time::Instant;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot::Sender as OneshotSender;
-use crate::php::ffi::php_handle_auth_data;
 
 pub struct ServerContext {
     pub request_ctx: Option<PhpRequestContext>,
@@ -64,7 +65,7 @@ impl ServerContext {
     }
 
     pub fn get_mut() -> Option<&'static mut Self> {
-        let globals = unsafe { ext_php_rs_sapi_globals().as_mut() }.expect("Invalid SAPI globals");
+        let globals = WorkerContext::get_sapi_globals_mut();
 
         unsafe { globals.server_context.cast::<Self>().as_mut() }
     }
@@ -86,7 +87,7 @@ impl WorkerContext {
     pub fn new(worker_id: usize) -> Self {
         unsafe { ext_php_rs_sapi_per_thread_init() }
 
-        let mut sg = SapiGlobals::get_mut();
+        let sg = Self::get_sapi_globals_mut();
 
         if !sg.server_context.is_null() {
             panic!("server context already set");
@@ -97,6 +98,14 @@ impl WorkerContext {
         sg.server_context = server_ctx.as_mut() as *mut _ as *mut _;
 
         Self { server_ctx }
+    }
+
+    pub fn get_sapi_globals() -> &'static SapiGlobals {
+        unsafe { &*ext_php_rs_sapi_globals() }
+    }
+
+    pub fn get_sapi_globals_mut() -> &'static mut SapiGlobals {
+        unsafe { &mut *ext_php_rs_sapi_globals() }
     }
 
     pub fn handle_request(
@@ -113,7 +122,7 @@ impl WorkerContext {
 
 impl Drop for WorkerContext {
     fn drop(&mut self) {
-        SapiGlobals::get_mut().server_context = std::ptr::null_mut();
+        Self::get_sapi_globals_mut().server_context = std::ptr::null_mut();
 
         unsafe {
             ext_php_rs_sapi_per_thread_shutdown();
@@ -217,18 +226,20 @@ impl PhpRequestContext {
         file_handle.primary_script = true;
 
         let result = try_catch_first(AssertUnwindSafe(|| unsafe {
-            if php_request_startup() != ZEND_RESULT_CODE_SUCCESS {
+            let result = self.in_span("php_request_startup", || { php_request_startup() });
+
+            if result != ZEND_RESULT_CODE_SUCCESS {
                 return false;
             }
 
-            php_execute_script(&raw mut file_handle);
+            self.in_span("php_execute_script", || { php_execute_script(&raw mut file_handle); });
 
             // PHP expects this to be called before request shutdown
             zend_destroy_file_handle(&raw mut file_handle);
 
             attempted_shutdown = true;
 
-            php_request_shutdown(std::ptr::null_mut());
+            self.in_span("php_request_shutdown", || { php_request_shutdown(std::ptr::null_mut()); });
 
             true
         }));
@@ -257,8 +268,34 @@ impl PhpRequestContext {
         }
     }
 
+    fn in_span<T>(
+        &self,
+        phase: &'static str,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let span = tracing::info_span!(
+        "php_execution_phase",
+        phase = phase,
+        duration = tracing::field::Empty,
+    );
+
+        let start = Instant::now();
+
+        let result = {
+            let _guard = span.enter();
+            f()
+        };
+
+        span.record(
+            "duration",
+            start.elapsed().as_micros(),
+        );
+
+        result
+    }
+
     unsafe fn populate_request_info(&self) {
-        let mut sapi_globals = SapiGlobals::get_mut();
+        let sapi_globals = WorkerContext::get_sapi_globals_mut();
 
         sapi_globals.sapi_headers.http_response_code = StatusCode::OK.as_u16() as c_int;
 
@@ -491,7 +528,7 @@ impl PhpRequestContext {
 
 impl Drop for PhpRequestContext {
     fn drop(&mut self) {
-        let mut sapi_globals = SapiGlobals::get_mut();
+        let sapi_globals = WorkerContext::get_sapi_globals_mut();
 
         sapi_globals.request_info.request_method = std::ptr::null();
         sapi_globals.request_info.request_uri = std::ptr::null_mut();

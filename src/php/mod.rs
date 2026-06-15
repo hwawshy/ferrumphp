@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Sender as OneshotSender;
+use tracing::Span;
 
 mod context;
 mod ffi;
@@ -18,6 +19,7 @@ pub mod service;
 mod worker;
 
 pub struct Job {
+    pub span: Span,
     pub request_head: RequestParts,
     pub request_body_rx: Option<Receiver<Bytes>>,
     pub response_head_tx: OneshotSender<ResponseParts>,

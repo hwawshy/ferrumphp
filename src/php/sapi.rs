@@ -1,22 +1,22 @@
 use crate::CONFIG;
-use crate::php::context::ServerContext;
+use crate::php::context::{ServerContext, WorkerContext};
 use crate::php::ffi::{ferrumphp_error, php_handle_aborted_connection, sapi_send_headers};
 use crate::php::interned::{INTERNED, Interned};
 use bytes::{Buf, Bytes};
-use ext_php_rs::boxed::ZBox;
 use ext_php_rs::builders::{ModuleBuilder, SapiBuilder};
 use ext_php_rs::embed::{SapiModule, ext_php_rs_sapi_shutdown, ext_php_rs_sapi_startup};
 use ext_php_rs::ffi::{
     ZEND_RESULT_CODE_FAILURE, ZEND_RESULT_CODE_SUCCESS, php_module_shutdown, php_module_startup,
     sapi_headers_struct, sapi_shutdown, sapi_startup,
 };
-use ext_php_rs::types::{ZendStr, Zval};
-use ext_php_rs::zend::{SapiGlobals, StaticModuleEntry};
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue};
+use ext_php_rs::types::Zval;
+use ext_php_rs::zend::StaticModuleEntry;
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Response, StatusCode};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::Read;
 use std::str::FromStr;
+use std::time::Instant;
 
 static MODULE: StaticModuleEntry = StaticModuleEntry::new();
 
@@ -114,7 +114,7 @@ unsafe extern "C" fn module_startup(_type: i32, _module_number: i32) -> i32 {
     ZEND_RESULT_CODE_SUCCESS
 }
 extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
-    println!("ub_write");
+    let t = Instant::now();
 
     if str.is_null() || str_length == 0 {
         return 0;
@@ -133,13 +133,21 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
 
     // This will buffer if headers are not sent yet. Maybe some memory check here?
     if let Err(_) = ctx.response_tx.blocking_send(Bytes::from(buf)) {
-        println!("aborted connection");
+        tracing::info!("aborted php connection");
         unsafe {
             php_handle_aborted_connection();
         }
 
         return 0;
     }
+
+    let elapsed = t.elapsed();
+
+    tracing::trace!(
+        ?elapsed,
+        requested = str_length,
+        "ub_write"
+    );
 
     buf.len()
 }
@@ -155,7 +163,7 @@ extern "C" fn log_message(message: *const c_char, _syslog_type: c_int) {
 
 extern "C" fn flush(_server_context: *mut c_void) {
     // Force sending of headers, which will also flush any buffered body bytes
-    println!("flush");
+    let t = Instant::now();
 
     if let Some(_) = ServerContext::get_mut() {
         // Our send_headers fails on client disconnection
@@ -163,17 +171,20 @@ extern "C" fn flush(_server_context: *mut c_void) {
             unsafe { php_handle_aborted_connection() }
         }
     }
+
+    let elapsed = t.elapsed();
+
+    tracing::trace!(?elapsed, "flush");
 }
 
 extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
-    println!("send_headers");
+    let t = Instant::now();
 
-    if SapiGlobals::get_mut().request_info().no_headers {
+    if WorkerContext::get_sapi_globals().request_info().no_headers {
         return SapiHeaderSendResult::SentSuccessfully.into();
     }
 
     let Some(ctx) = ServerContext::get_request_context_mut() else {
-        // @todo when can this happen? panic here?
         return SapiHeaderSendResult::SendFailed.into();
     };
 
@@ -226,23 +237,25 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
         return SapiHeaderSendResult::SendFailed.into();
     }
 
+    let elapsed = t.elapsed();
+
+    tracing::trace!(?elapsed, "send_headers");
+
     SapiHeaderSendResult::SentSuccessfully.into()
 }
 
 extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
-    println!("read_post");
+    let t = Instant::now();
 
     if buffer.is_null() || length == 0 {
         return 0;
     }
 
     let Some(ctx) = ServerContext::get_request_context_mut() else {
-        // @todo when can this happen? panic here?
         return 0;
     };
 
     let Some(ref mut body_rx) = ctx.request_body_rx else {
-        // @todo when can this happen? panic here?
         return 0;
     };
 
@@ -273,6 +286,15 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
         }
     }
 
+    let elapsed = t.elapsed();
+
+    tracing::trace!(
+        ?elapsed,
+        requested = length,
+        written = written,
+        "read_post"
+    );
+
     written
 }
 
@@ -288,6 +310,8 @@ extern "C" fn read_cookies() -> *mut c_char {
 }
 
 extern "C" fn register_server_variables(vars: *mut Zval) {
+    println!("register_server_variables");
+    let t = Instant::now();
     // SAFETY: PHP ensures pointer is de-referencable
     let Some(vars) = (unsafe { vars.as_mut() }).and_then(|x| x.array_mut()) else {
         return;
@@ -298,13 +322,22 @@ extern "C" fn register_server_variables(vars: *mut Zval) {
     };
 
     unsafe { ctx.register_server_variables(vars) };
+
+    let elapsed = t.elapsed();
+
+    tracing::trace!(?elapsed, "register_server_variables");
 }
 
 extern "C" fn deactivate() -> c_int {
-    println!("deactivate");
+    let t = Instant::now();
+
     if let Some(ctx) = ServerContext::get_mut() {
         ctx.finish_request();
     }
+
+    let elapsed = t.elapsed();
+
+    tracing::trace!(?elapsed, "deactivate");
 
     ZEND_RESULT_CODE_SUCCESS
 }
