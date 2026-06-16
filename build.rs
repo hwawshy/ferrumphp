@@ -2,9 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rustc-link-search=/opt/php-8.5-embed-zts-debug/lib");
     println!("cargo:rustc-link-lib=dylib=php");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,/opt/php-8.5-embed-zts-debug/lib");
     println!("cargo:rerun-if-changed=build/ferrumphp.h");
     println!("cargo:rerun-if-changed=build/ferrumphp.c");
 
@@ -18,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     cc::Build::new()
-        .compiler("clang-18")
+        .compiler("clang")
         .define("ZTS", "1")
         .file("build/ferrumphp.c")
         .includes(include_paths)
@@ -46,6 +44,13 @@ fn find_php_config() -> Option<PathBuf> {
         if path.try_exists().ok()? {
             return Some(path);
         }
+    }
+
+    let cmd = Command::new("which").arg("php-config").output().ok()?;
+    if cmd.status.success() {
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+
+        return stdout.trim().lines().next().map(|l| l.trim().into());
     }
 
     None

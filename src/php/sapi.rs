@@ -299,6 +299,8 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
 }
 
 extern "C" fn read_cookies() -> *mut c_char {
+    tracing::trace!("read_cookies");
+
     let Some(ctx) = ServerContext::get_request_context_mut() else {
         return std::ptr::null_mut();
     };
@@ -310,7 +312,6 @@ extern "C" fn read_cookies() -> *mut c_char {
 }
 
 extern "C" fn register_server_variables(vars: *mut Zval) {
-    println!("register_server_variables");
     let t = Instant::now();
     // SAFETY: PHP ensures pointer is de-referencable
     let Some(vars) = (unsafe { vars.as_mut() }).and_then(|x| x.array_mut()) else {
