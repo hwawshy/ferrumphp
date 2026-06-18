@@ -132,7 +132,10 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
     // );
 
     // This will buffer if headers are not sent yet. Maybe some memory check here?
-    if let Err(_) = ctx.response_tx.blocking_send(Bytes::from(buf)) {
+    // Bytes::from expects a &'static [u8] and does not copy the underlying memory, which causes
+    // a bug because PHP changes the underlying data after the function returns, that's why calling
+    // to_vec is necessary
+    if let Err(_) = ctx.response_tx.blocking_send(Bytes::from(buf.to_vec())) {
         tracing::info!("aborted php connection");
         unsafe {
             php_handle_aborted_connection();
