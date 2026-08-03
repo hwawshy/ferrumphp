@@ -226,20 +226,24 @@ impl PhpRequestContext {
         file_handle.primary_script = true;
 
         let result = try_catch_first(AssertUnwindSafe(|| unsafe {
-            let result = self.in_span("php_request_startup", || { php_request_startup() });
+            let result = self.in_span("php_request_startup", || php_request_startup());
 
             if result != ZEND_RESULT_CODE_SUCCESS {
                 return false;
             }
 
-            self.in_span("php_execute_script", || { php_execute_script(&raw mut file_handle); });
+            self.in_span("php_execute_script", || {
+                php_execute_script(&raw mut file_handle);
+            });
 
             // PHP expects this to be called before request shutdown
             zend_destroy_file_handle(&raw mut file_handle);
 
             attempted_shutdown = true;
 
-            self.in_span("php_request_shutdown", || { php_request_shutdown(std::ptr::null_mut()); });
+            self.in_span("php_request_shutdown", || {
+                php_request_shutdown(std::ptr::null_mut());
+            });
 
             true
         }));
@@ -268,16 +272,12 @@ impl PhpRequestContext {
         }
     }
 
-    fn in_span<T>(
-        &self,
-        phase: &'static str,
-        f: impl FnOnce() -> T,
-    ) -> T {
+    fn in_span<T>(&self, phase: &'static str, f: impl FnOnce() -> T) -> T {
         let span = tracing::info_span!(
-        "php_execution_phase",
-        phase = phase,
-        duration = tracing::field::Empty,
-    );
+            "php_execution_phase",
+            phase = phase,
+            duration = tracing::field::Empty,
+        );
 
         let start = Instant::now();
 
@@ -286,10 +286,7 @@ impl PhpRequestContext {
             f()
         };
 
-        span.record(
-            "duration",
-            start.elapsed().as_micros(),
-        );
+        span.record("duration", start.elapsed().as_micros());
 
         result
     }

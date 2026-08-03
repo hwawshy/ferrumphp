@@ -146,11 +146,7 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
 
     let elapsed = t.elapsed();
 
-    tracing::trace!(
-        ?elapsed,
-        requested = str_length,
-        "ub_write"
-    );
+    tracing::trace!(?elapsed, requested = str_length, "ub_write");
 
     buf.len()
 }
@@ -291,12 +287,7 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
 
     let elapsed = t.elapsed();
 
-    tracing::trace!(
-        ?elapsed,
-        requested = length,
-        written = written,
-        "read_post"
-    );
+    tracing::trace!(?elapsed, requested = length, written = written, "read_post");
 
     written
 }
