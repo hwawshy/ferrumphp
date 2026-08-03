@@ -23,6 +23,7 @@ ipnet = "2.12.0"
 tower-http = { version = "0.6.11", features = ["trace", "request-id"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+log = "0.4.29"
 [build-dependencies]
 ext-php-rs-bindgen = "0.72.1-extphprs.1"
 cc = "1.2.62"

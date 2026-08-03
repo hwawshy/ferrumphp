@@ -40,10 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // taken from ext-php-rs
 fn find_php_config() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PHP_CONFIG").map(PathBuf::from) {
-        if path.try_exists().ok()? {
-            return Some(path);
-        }
+    if let Some(path) = std::env::var_os("PHP_CONFIG").map(PathBuf::from)
+        && path.try_exists().ok()?
+    {
+        return Some(path);
     }
 
     let cmd = Command::new("which").arg("php-config").output().ok()?;

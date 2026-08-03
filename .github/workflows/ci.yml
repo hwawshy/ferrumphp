@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format & manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format
+        run: cargo fmt --check
+      - name: Validate manifest
+        run: cargo metadata --no-deps --format-version 1 >/dev/null
+
+  build:
+    name: Build (PHP ${{ matrix.php }})
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: [8.5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ matrix.php }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            build-${{ matrix.php }}-cargo-
+      - name: Setup PHP (ZTS)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+        env:
+          phpts: zts
+      - name: Install bindgen dependency
+        run: sudo apt-get install -y libclang-dev
+      - name: Link libphp for embed SAPI
+        run: |
+          ls /usr/lib/libphp${{ matrix.php }}.so
+          sudo ln -sf /usr/lib/libphp${{ matrix.php }}.so /usr/lib/libphp.so
+      - name: Check PHP toolchain
+        run: |
+          php-config --version
+          php -i | grep -i 'thread safety'
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build (release)
+        run: cargo build --release --bin ferrumphp

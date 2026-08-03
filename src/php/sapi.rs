@@ -135,7 +135,11 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
     // Bytes::from expects a &'static [u8] and does not copy the underlying memory, which causes
     // a bug because PHP changes the underlying data after the function returns, that's why calling
     // to_vec is necessary
-    if let Err(_) = ctx.response_tx.blocking_send(Bytes::from(buf.to_vec())) {
+    if ctx
+        .response_tx
+        .blocking_send(Bytes::from(buf.to_vec()))
+        .is_err()
+    {
         tracing::info!("aborted php connection");
         unsafe {
             php_handle_aborted_connection();
@@ -146,11 +150,7 @@ extern "C" fn ub_write(str: *const c_char, str_length: usize) -> usize {
 
     let elapsed = t.elapsed();
 
-    tracing::trace!(
-        ?elapsed,
-        requested = str_length,
-        "ub_write"
-    );
+    tracing::trace!(?elapsed, requested = str_length, "ub_write");
 
     buf.len()
 }
@@ -168,7 +168,7 @@ extern "C" fn flush(_server_context: *mut c_void) {
     // Force sending of headers, which will also flush any buffered body bytes
     let t = Instant::now();
 
-    if let Some(_) = ServerContext::get_mut() {
+    if ServerContext::get_mut().is_some() {
         // Our send_headers fails on client disconnection
         if unsafe { sapi_send_headers() } == ZEND_RESULT_CODE_FAILURE {
             unsafe { php_handle_aborted_connection() }
@@ -235,7 +235,7 @@ extern "C" fn send_headers(sapi_headers: *mut sapi_headers_struct) -> c_int {
     parts.headers = map;
     parts.status = status.unwrap_or(StatusCode::OK);
 
-    if let Err(_) = sender.send(parts) {
+    if sender.send(parts).is_err() {
         // Future dropped together with receiver. Happens when client disconnects
         return SapiHeaderSendResult::SendFailed.into();
     }
@@ -291,12 +291,7 @@ extern "C" fn read_post(buffer: *mut c_char, length: usize) -> usize {
 
     let elapsed = t.elapsed();
 
-    tracing::trace!(
-        ?elapsed,
-        requested = length,
-        written = written,
-        "read_post"
-    );
+    tracing::trace!(?elapsed, requested = length, written = written, "read_post");
 
     written
 }

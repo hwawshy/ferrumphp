@@ -50,12 +50,14 @@ impl ServerContext {
         head_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
     ) -> Result<(), ()> {
+        tracing::info!("Worker {} processing request", self.worker_config.worker_id);
+
         let request_ctx =
             PhpRequestContext::new(request_head, request_body_rx, head_tx, response_tx).unwrap();
 
         self.request_ctx = Some(request_ctx);
 
-        if let Err(_) = unsafe { self.request_ctx.as_ref().unwrap().execute() } {
+        if unsafe { self.request_ctx.as_ref().unwrap().execute() }.is_err() {
             self.finish_request();
 
             return Err(());
@@ -226,20 +228,24 @@ impl PhpRequestContext {
         file_handle.primary_script = true;
 
         let result = try_catch_first(AssertUnwindSafe(|| unsafe {
-            let result = self.in_span("php_request_startup", || { php_request_startup() });
+            let result = self.in_span("php_request_startup", || php_request_startup());
 
             if result != ZEND_RESULT_CODE_SUCCESS {
                 return false;
             }
 
-            self.in_span("php_execute_script", || { php_execute_script(&raw mut file_handle); });
+            self.in_span("php_execute_script", || {
+                php_execute_script(&raw mut file_handle);
+            });
 
             // PHP expects this to be called before request shutdown
             zend_destroy_file_handle(&raw mut file_handle);
 
             attempted_shutdown = true;
 
-            self.in_span("php_request_shutdown", || { php_request_shutdown(std::ptr::null_mut()); });
+            self.in_span("php_request_shutdown", || {
+                php_request_shutdown(std::ptr::null_mut());
+            });
 
             true
         }));
@@ -268,16 +274,12 @@ impl PhpRequestContext {
         }
     }
 
-    fn in_span<T>(
-        &self,
-        phase: &'static str,
-        f: impl FnOnce() -> T,
-    ) -> T {
+    fn in_span<T>(&self, phase: &'static str, f: impl FnOnce() -> T) -> T {
         let span = tracing::info_span!(
-        "php_execution_phase",
-        phase = phase,
-        duration = tracing::field::Empty,
-    );
+            "php_execution_phase",
+            phase = phase,
+            duration = tracing::field::Empty,
+        );
 
         let start = Instant::now();
 
@@ -286,10 +288,7 @@ impl PhpRequestContext {
             f()
         };
 
-        span.record(
-            "duration",
-            start.elapsed().as_micros(),
-        );
+        span.record("duration", start.elapsed().as_micros());
 
         result
     }
@@ -317,11 +316,11 @@ impl PhpRequestContext {
 
         // PHP expects the value of auth header to be a C string and copies anything it wants,
         // so we are free to drop the C string after the php_handle_auth_data function call.
-        if let Some(auth) = self.headers.get(AUTHORIZATION) {
-            if let Ok(auth) = CString::new(auth.as_bytes()) {
-                unsafe {
-                    php_handle_auth_data(auth.as_ptr());
-                }
+        if let Some(auth) = self.headers.get(AUTHORIZATION)
+            && let Ok(auth) = CString::new(auth.as_bytes())
+        {
+            unsafe {
+                php_handle_auth_data(auth.as_ptr());
             }
         }
     }
@@ -488,7 +487,7 @@ impl PhpRequestContext {
         }
 
         let mut zval = Zval::new();
-        let _ = zval.set_long(remote.port());
+        zval.set_long(remote.port());
 
         let _ = vars.insert(&interned.remote_port, zval);
     }

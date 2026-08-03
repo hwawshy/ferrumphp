@@ -111,7 +111,7 @@ impl Service<Request<Incoming>> for PhpService {
             (job, fut)
         };
 
-        if let Err(_) = self.sender.send_item(job) {
+        if self.sender.send_item(job).is_err() {
             return PhpFuture::Err(PhpError::JobChannelClosed);
         };
 
@@ -211,7 +211,7 @@ impl Future for PhpFuture {
                 response_head_rx, ..
             } => {
                 let parts = ready!(Pin::new(response_head_rx).poll(cx))
-                    .map_err(|e| PhpError::ResponseHeadClosed(e))?;
+                    .map_err(PhpError::ResponseHeadClosed)?;
 
                 match this.transition_to_done() {
                     PhpFuture::WithoutRequestBody {
