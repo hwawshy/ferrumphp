@@ -115,7 +115,7 @@ interned_server_vars! {
         script_filename => "SCRIPT_FILENAME",
         document_root => "DOCUMENT_ROOT",
         path_info => "PATH_INFO",
-        path_translated => "PATH_TRANSLATED",
+        //path_translated => "PATH_TRANSLATED",
         php_self => "PHP_SELF",
 
         // Client identity
@@ -123,7 +123,7 @@ interned_server_vars! {
         remote_port => "REMOTE_PORT",
 
         // Security
-        https => "HTTPS",
+        //https => "HTTPS",
 
         // Standard HTTP_* header keys
         http_accept => "HTTP_ACCEPT",

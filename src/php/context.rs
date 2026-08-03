@@ -50,12 +50,14 @@ impl ServerContext {
         head_tx: OneshotSender<ResponseParts>,
         response_tx: Sender<Bytes>,
     ) -> Result<(), ()> {
+        tracing::info!("Worker {} processing request", self.worker_config.worker_id);
+
         let request_ctx =
             PhpRequestContext::new(request_head, request_body_rx, head_tx, response_tx).unwrap();
 
         self.request_ctx = Some(request_ctx);
 
-        if let Err(_) = unsafe { self.request_ctx.as_ref().unwrap().execute() } {
+        if unsafe { self.request_ctx.as_ref().unwrap().execute() }.is_err() {
             self.finish_request();
 
             return Err(());
@@ -314,11 +316,11 @@ impl PhpRequestContext {
 
         // PHP expects the value of auth header to be a C string and copies anything it wants,
         // so we are free to drop the C string after the php_handle_auth_data function call.
-        if let Some(auth) = self.headers.get(AUTHORIZATION) {
-            if let Ok(auth) = CString::new(auth.as_bytes()) {
-                unsafe {
-                    php_handle_auth_data(auth.as_ptr());
-                }
+        if let Some(auth) = self.headers.get(AUTHORIZATION)
+            && let Ok(auth) = CString::new(auth.as_bytes())
+        {
+            unsafe {
+                php_handle_auth_data(auth.as_ptr());
             }
         }
     }
@@ -485,7 +487,7 @@ impl PhpRequestContext {
         }
 
         let mut zval = Zval::new();
-        let _ = zval.set_long(remote.port());
+        zval.set_long(remote.port());
 
         let _ = vars.insert(&interned.remote_port, zval);
     }

@@ -24,6 +24,7 @@
           nativeBuildInputs = [
             pkgs.rustc
             pkgs.cargo
+            pkgs.clippy
           ];
 
           PHP_INI_SCAN_DIR = "${php}/lib";

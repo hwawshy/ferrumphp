@@ -26,12 +26,15 @@ impl Worker {
                 {
                     let _guard = span.enter();
 
-                    if let Err(_) = ctx.handle_request(
-                        job.request_head,
-                        job.request_body_rx,
-                        job.response_head_tx,
-                        job.response_body_tx,
-                    ) {
+                    if ctx
+                        .handle_request(
+                            job.request_head,
+                            job.request_body_rx,
+                            job.response_head_tx,
+                            job.response_body_tx,
+                        )
+                        .is_err()
+                    {
                         let _ = event_tx.send(WorkerEvent::ErrorExit(id));
                         return;
                     }
